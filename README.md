@@ -28,7 +28,8 @@ API に書き換えたものではありません。
 -   Alternant 符号
 -   Reed--Muller 符号
 -   Hadamard 符号
--   GRS 符号
+-   Reed–Solomon（RS）符号
+-   Generalized Reed–Solomon（GRS）符号
 -   Gabidulin（rank-metric）符号
 -   積符号（Product code）
 -   連接符号（Concatenated code）
@@ -47,21 +48,44 @@ Reed--Muller 復号経路を使用します。
 
 ## ビルド
 
-リポジトリのルートで実行します。
+`unified_codes.c` と `Makefile` をリポジトリのルートに置き、次を実行します。
 
-``` sh
-cc -O2 -std=gnu11 -fopenmp -Wall -Wextra unified_codes.c -lm -o unified_codes
+```sh
+# OpenMP を有効にしてビルド（既定）
+make
+
+# OpenMP を無効にしてビルド
+make OPENMP=
+
+# 生成した実行ファイルを削除
+make clean
+```
+
+Makefile を使わず直接ビルドする場合：
+
+```sh
+cc -O2 -std=gnu11 -Wall -Wextra -fopenmp \
+  -o unified_codes unified_codes.c -lm
 ```
 
 OpenMP を使わない場合：
 
-``` sh
-cc -O2 -std=gnu11 -Wall -Wextra unified_codes.c -lm -o unified_codes
+```sh
+cc -O2 -std=gnu11 -Wall -Wextra \
+  -o unified_codes unified_codes.c -lm
 ```
 
-未使用関数に関する警告が表示される場合があります。警告とコンパイルエラーは区別してください。
+`make` の既定設定は `CC=cc`、`CFLAGS=-O2 -std=gnu11 -Wall -Wextra`、
+`OPENMP=-fopenmp`、`LDLIBS=-lm` です。必要に応じて `CC`、`CFLAGS`、
+`OPENMP`、`LDFLAGS`、`LDLIBS` を make のコマンドラインで上書きできます。
+
+未使用関数に関する警告が表示される場合があります。OpenMP を無効にした場合は、
+OpenMP プラグマを無視する警告も表示されます。いずれも警告であり、
+コンパイルエラーとは区別してください。
 
 ## ヘルプ
+
+`--help` はコマンドラインの概要を表示するヘルプです。対話式メニューではありません。`--help-all` で AG 側と古典符号側の詳細ヘルプを続けて表示できます。
 
 ``` sh
 # 統合ヘルプ
@@ -136,13 +160,34 @@ AG 符号は既定のファミリーです。
   --code goppa --m 8 --t 10 --errors 10 -n 20
 ```
 
-### GRS 符号
+### Reed–Solomon（RS）符号とGeneralized Reed–Solomon（GRS）符号
 
-``` sh
+RS 符号は GRS 符号の特別な場合です。符号語は
+\((v_1f(a_1),\ldots,v_nf(a_n))\) として構成されます。
+
+- `--code rs`：列乗数をすべて \(v_i=1\) に固定する通常の RS 符号
+- `--code grs`：各列乗数に非零のランダムな有限体要素を使う GRS 符号
+- `-shuffle`：評価点の順序をランダム化
+
+RS 符号の例：
+
+```sh
+./unified_codes --family classical \
+  --code rs --m 8 --len 255 --k 223 \
+  --errors 10 --erasures 12
+```
+
+GRS 符号の例：
+
+```sh
 ./unified_codes --family classical \
   --code grs --m 8 --len 255 --k 223 \
   --errors 10 --erasures 12
 ```
+
+どちらも誤り数 \(e\) と消失数 \(s\) が \(2e+s\le n-k\) を満たす範囲を
+一意復号の保証範囲とします。同じ `m`、`len`、`k` を指定すれば、RS と GRS の
+符号長・次元・最小距離の下界を揃えて比較できます。
 ### Alternant 符号
 
 ```sh
@@ -271,87 +316,36 @@ README は特定のオープンソースライセンスを宣言しません。
 この README は `unified_codes.c`
 のコマンドラインヘルプと実装内容に基づいています。コンパイル可否や各符号の復号性能は、利用する環境・パラメータごとに個別に検証してください。未実施のベンチマークや未確認の訂正性能を保証するものではありません。
 
-## ファイル入力・復号結果の出力（古典二元符号）
+## ファイル入出力（古典二元符号）
 
-古典二元符号では、ファイルをメッセージビット列として読み込み、符号化、必要に応じた誤り付加、復号を行えます。現在のファイル入出力対応は `bch` / `golay` / `goppa` / `alt` / `rm` / `hadamard` です。GRS・Gabidulin・積符号・連接符号、および AG 符号側のファイル入出力はまだ対応していません。
+ファイル入出力は、現在 `bch` / `golay` / `goppa` / `alt` / `rm` /
+`hadamard` に対応しています。`grs` / `rank`（Gabidulin）/ `product` /
+`concat` および AG 符号側は、このファイル入出力モードの対象外です。
 
-```sh
-# バイナリファイルを読み込み、誤りを付けずに復号してバイナリ保存
-./unified_codes --family classical --code golay \
-  --input data.bin --input-format binary --no-errors \
-  --output decoded.bin --output-format binary
-
-# テキストの 0/1 列を読み込み、各符号ブロックに 2 個ずつ誤りを付加
-./unified_codes --family classical --code bch --m 5 --t 2 \
-  --input message.txt --input-format text --errors 2 \
-  --output decoded.txt --output-format text
-
-# 復号ビット列を標準出力に表示
-./unified_codes --family classical --code golay \
-  --input message.txt --input-format text --no-errors \
-  --output-format screen
-```
+入力ファイルはメッセージビット列として読み込まれ、符号化、必要に応じた誤り付加、復号を行います。
 
 | オプション | 意味 |
 |---|---|
 | `--input FILE` | 入力ファイル |
-| `--input-format binary\|text` | 入力形式。既定値は `binary` |
-| `--output FILE` | 出力ファイル（`screen` 以外では必須） |
-| `--output-format binary\|text\|screen` | 出力形式。既定値は `screen` |
-| `--no-errors` | 誤りを付加しない |
-| `--errors E` | 各符号ブロックに E 個の誤りをランダムに付加 |
-
-バイナリ入力は各バイトの最上位ビットから順にビット列へ展開します。入力データは符号次元 `k` ビット単位に分割し、最後のブロックが不足する場合は内部で 0 を補います。復号後は元の入力ビット長に切り詰めて出力するため、バイナリ入力では元のファイル長が保たれます。テキスト入力は `0` と `1` および空白文字のみを受け付けます。テキスト入力を `binary` 出力する場合、最終バイトの未使用ビットは 0 で埋められます。
-
-`--errors` を省略したファイルモードは誤りなし（0 個）です。`--errors E` はファイル全体ではなく、符号化した各ブロックに E 個ずつ誤りを付加します。現段階ではファイルモードの消失訂正（`--erasures`）は未対応です。各ブロックの復号成功・検出失敗・誤訂正の件数と処理時間は標準エラー出力に表示されます。
-
-## Makefile によるビルド
-
-ソース `unified_codes.c` と `Makefile` を同じディレクトリに置き、次を実行します。
-
-```sh
-make
-```
-
-OpenMP を使わずにビルドする場合：
-
-```sh
-make clean
-make OPENMP=
-```
-
-実行ファイルを削除する場合：
-
-```sh
-make clean
-```
-
-## ファイル入出力（古典的な二元符号）
-
-ファイル入出力モードは、現状では `bch`、`golay`、`goppa`、`alt`、`rm`、`hadamard` に対応します。`grs`、`rank`、`product`、`concat` および AG 符号側は、このファイル入出力モードの対象外です。
-
-主なオプション：
-
-| オプション | 意味 |
-|---|---|
-| `--input FILE` | 入力ファイル |
-| `--input-format binary` | 入力を任意のバイナリデータとして読む（既定） |
+| `--input-format binary` | 任意のバイナリデータとして読む（既定値） |
 | `--input-format text` | `0` と `1` からなるビット列テキストとして読む。空白・改行は無視 |
 | `--no-errors` | 誤りを付加しない |
 | `--errors N` | 各符号ブロックに N 個のランダムなビット誤りを付加 |
 | `--output FILE` | 復号結果の出力先 |
 | `--output-format binary` | 復号結果をバイナリで保存 |
 | `--output-format text` | 復号結果を `0`/`1` のテキストで保存 |
-| `--output-format screen` | 復号結果を画面に表示（既定） |
+| `--output-format screen` | 復号結果を画面に表示（既定値） |
 
-入力ビット列は符号の情報長 `k` ごとに分割されます。最後のブロックが `k` ビットに満たない場合は、符号化時に末尾を 0 で埋め、復号後は元のビット長に切り詰めます。バイナリ入力・出力では、各バイトの最上位ビットから順に処理します。
+バイナリ入力は各バイトの最上位ビットから順にビット列へ展開します。入力ビット列は符号の情報長 `k` ごとに分割されます。最後のブロックが `k` ビットに満たない場合は、符号化時に末尾を 0 で埋め、復号後は元の入力ビット長に切り詰めます。そのため、バイナリ入力では誤りなしの往復時に元のファイル長が保たれます。テキスト入力は `0` と `1` および空白文字のみを受け付けます。テキスト入力を `binary` 出力する場合、最終バイトの未使用ビットは 0 で埋められます。
+
+`--errors` を省略したファイルモードは誤りなし（0 個）です。`--errors N` はファイル全体ではなく、符号化した各ブロックに N 個ずつ誤りを付加します。現段階ではファイルモードの消失訂正（`--erasures`）は未対応です。`-n` もファイルモードでは使用しません。各ブロックの復号成功・検出失敗・誤訂正の件数と処理時間は標準エラー出力に表示されます。
 
 ### 例1：バイナリファイルを誤りなしで往復
 
 ```sh
-./unified_codes --family classical --code golay \\
-  --input input.bin --input-format binary \\
-  --no-errors \\
+./unified_codes --family classical --code golay \
+  --input input.bin --input-format binary \
+  --no-errors \
   --output decoded.bin --output-format binary
 cmp input.bin decoded.bin
 ```
@@ -361,9 +355,9 @@ cmp input.bin decoded.bin
 ### 例2：バイナリファイルに各ブロック2個の誤りを付加
 
 ```sh
-./unified_codes --family classical --code golay \\
-  --input input.bin --input-format binary \\
-  --errors 2 \\
+./unified_codes --family classical --code golay \
+  --input input.bin --input-format binary \
+  --errors 2 \
   --output decoded.bin --output-format binary
 cmp input.bin decoded.bin
 ```
@@ -380,17 +374,17 @@ cmp input.bin decoded.bin
 実行：
 
 ```sh
-./unified_codes --family classical --code bch --m 5 --t 2 \\
-  --input message.txt --input-format text \\
-  --errors 2 \\
+./unified_codes --family classical --code bch --m 5 --t 2 \
+  --input message.txt --input-format text \
+  --errors 2 \
   --output decoded.txt --output-format text
 ```
 
 ### 例4：復号結果を画面に表示
 
 ```sh
-./unified_codes --family classical --code rm --r 1 --m 5 \\
-  --input message.txt --input-format text \\
+./unified_codes --family classical --code rm --r 1 --m 5 \
+  --input message.txt --input-format text \
   --no-errors --output-format screen
 ```
 
@@ -403,15 +397,6 @@ cmp input.bin decoded.bin
 ./unified_codes --family classical --code bch --m 6 --t 3 --list
 ./unified_codes --family classical --code rm --r 2 --m 6 --list
 ```
-
-全オプションは次で確認できます。
-
-```sh
-./unified_codes --family classical --help
-./unified_codes --help-all
-```
-
-**注意：** ファイルモードで `--errors N` を指定すると、各ブロックに N 個の誤りをランダムに付加します。誤りなしが目的なら `--no-errors` を指定してください。`--erasures` と `-n` はファイルモードでは使用できません。
 
 ## 積符号・Gabidulin符号の復号
 
@@ -429,7 +414,7 @@ cmp input.bin decoded.bin
   --c1 bch:5:2 --c2 golay --errors 8 --iters 10 -n 100 123
 ```
 
-`--iters` は行・列の復号を交互に行う最大スイープ回数です。最終段階で全行が `C1`、全列が `C2` の符号語になっているかを再検査します。これは反復復号であり、積符号の最小距離から得られる一般的な最尤復号保証半径内で常に成功することを意味しません。検査を通過しても、別の積符号語への誤訂正は理論上あり得ます。
+`--iters` は行・列の復号を交互に行う最大スイープ回数です。最終段階で全行が `C1`、全列が `C2` の符号語になっているかを再検査します。出力に表示される `code-theoretic unique-decoding radius` は、積符号の最小距離 `d` から計算した理論上の半径 `floor((d-1)/2)` です。これは、この行・列の反復復号器がその半径内で常に成功するという保証ではありません。反復復号後の制約検査を通過しても、別の積符号語への誤訂正は理論上あり得ます。
 
 ### Gabidulin符号 (`--code rank`)
 

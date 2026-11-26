@@ -9974,15 +9974,15 @@ static void run_concat(GRS *G, const BinCode *In, int trials, int nerr,
 static void usage(void) {
   puts(
       "codes [options] [seed]\n"
-      "  --code bch|golay|goppa|alt|rm|hadamard|grs|rank|product|concat   "
+      "  --code bch|golay|goppa|alt|rm|hadamard|rs|grs|rank|product|concat   "
       "(default bch)\n"
       "  --m m           field GF(2^m), m <= 12              (default per "
       "code)\n"
       "  --poly 0x43     primitive polynomial of GF(2^m)     (default: "
       "standard)\n"
       "  --len n         code length (bch: also divisors of 2^m-1 => cyclic; "
-      "goppa/alt/grs/rank)\n"
-      "  --k k           dimension (grs, rank, concat outer code)\n"
+      "goppa/alt/rs/grs/rank)\n"
+      "  --k k           dimension (rs, grs, rank, concat outer code)\n"
       "  --t t           correction capability (bch, goppa = deg g, alt)\n"
       "  --r r           Reed-Muller order: RM(r,m), length 2^m     (default "
       "2)\n"
@@ -9990,7 +9990,7 @@ static void usage(void) {
       "  --ext           golay: extended [24,12,8] code\n"
       "  --errors e      injected errors (bits / symbols / rank / total bits)\n"
       "                  default: the guaranteed capability of the code\n"
-      "  --erasures s    injected erasures (bch, alt, grs)\n"
+      "  --erasures s    injected erasures (bch, alt, rs, grs)\n"
       "  --input FILE    encode/decode data from a file (binary-code "
       "families)\n"
       "  --input-format binary|text   input format (default binary)\n"
@@ -10006,8 +10006,8 @@ static void usage(void) {
       "  --iters N       product: maximal row/column sweeps  (default 8)\n"
       "  -fht            RM(1,m): ML decoding by the fast Walsh-Hadamard "
       "transform\n"
-      "  -shuffle        grs: random order of the evaluation points\n"
-      "  -random-v       grs: random column multipliers (true GRS, not RS)\n"
+      "  -shuffle        rs/grs: random order of evaluation points\n"
+      "  -random-v       grs: explicit random-multiplier flag (GRS already defaults to it)\n"
       "  -n N            N random trials (summary only)       -v  every trial\n"
       "  -show-values    print vectors / error values\n"
       "  -list           only list the code parameters and exit\n"
@@ -10016,6 +10016,7 @@ static void usage(void) {
       "  codes --code rm --r 2 --m 6 --errors 7 -n 200\n"
       "  codes --code golay --ext --errors 3 -n 1000\n"
       "  codes --code goppa --m 8 --t 10 --errors 10 -n 20\n"
+      "  codes --code rs  --m 8 --len 255 --k 223 --errors 10 --erasures 12\n"
       "  codes --code grs --m 8 --len 255 --k 223 --errors 10 --erasures 12\n"
       "  codes --code rank --m 8 --len 8 --k 4 --errors 2\n"
       "  codes --code product --c1 bch:5:2 --c2 golay --errors 8\n"
@@ -10167,18 +10168,21 @@ int codes_run(int argc, char **argv) {
       strcmp(output_format, "screen"))
     die("file mode is currently implemented for "
         "bch/golay/goppa/alt/rm/hadamard");
-  if (!strcmp(code, "grs")) {
+  if (!strcmp(code, "rs") || !strcmp(code, "grs")) {
     int mm = m ? m : 8;
+    if (!strcmp(code, "rs") && randv)
+      die("-random-v cannot be used with --code rs; use --code grs");
     GF *F = gf_new(mm, poly);
     int n = len > 0 ? len : F->ord, kk = k > 0        ? k
                                          : n - 32 > 0 ? n - 32
                                                       : n / 2;
-    GRS *G = grs_new(F, n, kk, shuffle, randv);
+    int use_randv = !strcmp(code, "grs") || randv;
+    GRS *G = grs_new(F, n, kk, shuffle, use_randv);
     if (nerr < 0)
       nerr = (n - kk) / 2;
     printf("# code: %s [%d,%d,%d] over GF(2^%d), corrects e errors + s "
            "erasures with 2e+s <= %d\n",
-           randv ? "GRS" : "RS", n, kk, n - kk + 1, mm, n - kk);
+           use_randv ? "GRS" : "RS", n, kk, n - kk + 1, mm, n - kk);
     if (only_list)
       return 0;
     run_grs(G, trials, nerr, nera, verbose, showv);
@@ -10258,7 +10262,7 @@ static void unified_usage(void) {
   puts("  ag          Algebraic-geometry codes (default; "
        "BBGS/Hermitian/Suzuki/custom)");
   puts("  classical   BCH, Golay, Goppa, alternant, Reed-Muller, Hadamard,");
-  puts("              GRS, Gabidulin(rank), product, and concatenated codes");
+  puts("              RS/GRS, Gabidulin(rank), product, and concatenated codes");
   puts("\nHELP");
   puts("  --help                    Show this overview");
   puts("  --help-all                Show the complete help for both families");
