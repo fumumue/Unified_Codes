@@ -694,6 +694,23 @@ typedef struct {
 } LSp;
 
 static int genus_g;
+/* Experimental multi-place Newton ordering: 0=legacy column order, 1=lexicographic
+ * valuation-vector order. This changes elimination pivot order, not the divisor
+ * constraints or the resulting function space. */
+static int multi_newton_order = 0;
+
+static int monomial_order_less(int ca, int cb) {
+  int ia = ca % dx_deg, ja = ca / dx_deg;
+  int ib = cb % dx_deg, jb = cb / dx_deg;
+  for (int q = 0; q < np; ++q) {
+    long va = (long)pl[q].wx * ia + (long)pl[q].wy * ja;
+    long vb = (long)pl[q].wx * ib + (long)pl[q].wy * jb;
+    if (va != vb)
+      return va < vb;
+  }
+  if (ja != jb) return ja < jb;
+  return ia < ib;
+}
 
 /* 旧 solve_L() の名前を変更 */
 static int solve_L_laurent(const int *mult, int Jfix, int Jstep, int Jmax,
@@ -725,6 +742,27 @@ static int solve_L_laurent(const int *mult, int Jfix, int Jstep, int Jmax,
       exit(1);
     }
     fe *Mx = calloc((size_t)((E > 0 && K > 0) ? E * K : 1), sizeof(fe));
+    int *col_order = malloc(sizeof(int) * (size_t)K);
+    int *rank_of_col = malloc(sizeof(int) * (size_t)K);
+    if (!col_order || !rank_of_col) {
+      free(col_order); free(rank_of_col); free(Mx);
+      for (int q = 0; q < np; ++q) free(S[q].pw);
+      free(Bv);
+      return -1;
+    }
+    for (int c = 0; c < K; ++c) col_order[c] = c;
+    if (multi_newton_order) {
+      /* Stable insertion sort by the vector of valuations at all places. */
+      for (int c = 1; c < K; ++c) {
+        int x = col_order[c], j = c;
+        while (j > 0 && monomial_order_less(x, col_order[j - 1])) {
+          col_order[j] = col_order[j - 1];
+          --j;
+        }
+        col_order[j] = x;
+      }
+    }
+    for (int c = 0; c < K; ++c) rank_of_col[col_order[c]] = c;
     size_t off = 0;
     for (int q = 0; q < np; q++) {
       int d = pl[q].d;
@@ -733,12 +771,13 @@ static int solve_L_laurent(const int *mult, int Jfix, int Jstep, int Jmax,
         for (int j = 0; j <= J; j++)
           for (int i = 0; i < dx_deg; i++) {
             int col = j * dx_deg + i;
+            int rank = rank_of_col[col];
             int v = pl[q].wx * i + pl[q].wy * j, r = -pl[q].b * i + pl[q].a * j;
             const fe *pw = S[q].pw + (size_t)(r - S[q].rmin) * sz;
             for (int t = 0; v + t <= ehi_q[q]; t++)
               for (int k = 0; k < d; k++) {
                 size_t row = off + (size_t)(v + t - S[q].vmin) * d + k;
-                Mx[row * K + col] = pw[(size_t)t * d + k];
+                Mx[row * K + rank] = pw[(size_t)t * d + k];
               }
           }
       }
@@ -802,8 +841,26 @@ static int solve_L_laurent(const int *mult, int Jfix, int Jstep, int Jmax,
             s ^= mul(R[col], x[col]);
         x[c] = s;
       }
+      /* Return coefficient vectors in the original j*dx_deg+i layout. */
+      for (int c = 0; c < K; ++c) {
+        int original_col = col_order[c];
+        if (original_col != c) {
+          /* x is temporarily kept in pivot-order coordinates; scatter below. */
+        }
+      }
+      fe *scattered = calloc((size_t)K, sizeof(fe));
+      if (!scattered) {
+        free(col_order); free(rank_of_col); free(Mx); free(pc); free(lr);
+        free(tmprow); free(isp); free(Bv);
+        return -1;
+      }
+      for (int c = 0; c < K; ++c) scattered[col_order[c]] = x[c];
+      memcpy(x, scattered, (size_t)K * sizeof(fe));
+      free(scattered);
       bi++;
     }
+    free(col_order);
+    free(rank_of_col);
     free(Mx);
     free(pc);
     free(lr);
@@ -5625,7 +5682,7 @@ static void usage(void) {
       "  --m m            base field GF(2^m), m <= 12             (default 6)\n"
       "  --poly 0x43      primitive polynomial of GF(2^m)       (default: "
       "standard)\n"
-      "  --curve bbgs|hermitian|suzuki  select a built-in curve family "
+      "  --curve bbgs|hermitian|suzuki|klein  select a built-in curve family "
       "(default "
       "bbgs)\n"
       "  --q auto|power-of-2   BBGS parameter q (power of 2); Suzuki: "
@@ -5650,9 +5707,11 @@ static void usage(void) {
       "them) as positions\n"
       "  --place k        pole place (index from the list); default: automatic "
       "choice\n"
+      "  --basis legacy|newton   multi-point elimination column order (default legacy)\n"
       "  --pole \"E2:140,E1:85\" or \"#3:100\"   multi-point divisor (E<k>: "
       "edge, #k: orbit)\n"
       "  -fr -bms -vote   one-point decoders to run (default: all)\n"
+      "  -ecp             independent Error-Correcting-Pair decoder (one-point AG)\n"
       "  -frvote          pure Feng-Rao majority voting (Newton path; no BMS, "
       "no dual basis)\n"
       "  -forney          use multivariate AG Forney-function evaluation for "
@@ -5669,6 +5728,10 @@ static void usage(void) {
       "  -encode          additionally generate a random AG codeword, add "
       "errors,\n"
       "                    decode, and verify exact recovery (with -basic)\n"
+      "  --concat-inner goppa:m:t[:n]  one-point Newton AG + binary Goppa concatenation (default);\n"
+      "                                add --pole to opt in to multi-point AG concatenation\n"
+      "  --concat-burst  inject a contiguous burst in the transmitted bit stream\n"
+      "  --interleave D  interleave D adjacent inner blocks (default 1 = off)\n"
       "  -nonewton        disabled: this build requires Newton-polygon bases\n"
       "  --place k        also avoids probing every candidate place (saves "
       "setup time)\n"
@@ -6645,8 +6708,159 @@ static int any_newton_place(int g) {
     }
   return 0;
 }
+
+/* -------------------------------------------------------------------------
+ * Error-correcting-pair decoder for one-point evaluation codes.
+ * C = ev(L(MP)); A = ev(L(aP)), a=t+g; B=(A*C)^perp.
+ * Since A*C is contained in ev(L((M+a)P)), the usual Goppa bounds certify
+ * d(A)>=n-a, d(C)>=n-M and d(B^perp)>=n-M-a.  The ECP inequalities are
+ * checked before decoding.  This path is deliberately independent of FR/BMS.
+ * The one-point simulator transmits the zero codeword, so recovered error
+ * values are the received symbols at the ECP common-zero positions.
+ */
+static int ecp_fit_support(int n, int k, const fe *G, const fe *y,
+                           const int *support, int ns, fe *err) {
+  int rows=n-ns, W=k+1;
+  if (rows<k) return 0;
+  fe *A=calloc((size_t)rows*W,sizeof(fe));
+  int *pivot=malloc((size_t)k*sizeof(int));
+  if (!A || !pivot) { free(A); free(pivot); return 0; }
+  int rr=0;
+  for (int p=0;p<n;p++) {
+    int skip=0; for (int q=0;q<ns;q++) if (support[q]==p) {skip=1;break;}
+    if (skip) continue;
+    for (int j=0;j<k;j++) A[(size_t)rr*W+j]=G[(size_t)j*n+p];
+    A[(size_t)rr*W+k]=y[p]; rr++;
+  }
+  int rank=0;
+  for (int c=0;c<k;c++) {
+    int p=rank; while (p<rows && !A[(size_t)p*W+c]) p++;
+    if (p==rows) { free(A); free(pivot); return 0; }
+    if (p!=rank) for (int j=c;j<W;j++) {fe z=A[(size_t)p*W+j];A[(size_t)p*W+j]=A[(size_t)rank*W+j];A[(size_t)rank*W+j]=z;}
+    fe iv=inv(A[(size_t)rank*W+c]);
+    for (int j=c;j<W;j++) A[(size_t)rank*W+j]=mul(A[(size_t)rank*W+j],iv);
+    for (int q=0;q<rows;q++) if(q!=rank) {
+      fe f=A[(size_t)q*W+c]; if(!f) continue;
+      for(int j=c;j<W;j++) A[(size_t)q*W+j]^=mul(f,A[(size_t)rank*W+j]);
+    }
+    pivot[rank++]=c;
+  }
+  for(int q=k;q<rows;q++) if(A[(size_t)q*W+k]) {free(A);free(pivot);return 0;}
+  fe *msg=calloc((size_t)k,sizeof(fe));
+  if(!msg){free(A);free(pivot);return 0;}
+  for(int q=0;q<k;q++) msg[pivot[q]]=A[(size_t)q*W+k];
+  for(int q=0;q<ns;q++) {
+    int pos=support[q]; fe cw=0;
+    for(int j=0;j<k;j++) if(msg[j]) cw^=mul(msg[j],G[(size_t)j*n+pos]);
+    err[q]=y[pos]^cw;
+    if(!err[q]) {free(msg);free(A);free(pivot);return 0;}
+  }
+  free(msg);free(A);free(pivot);return 1;
+}
+static int ecp_support_search(int n,int k,const fe *G,const fe *y,
+                              const int *cand,int nc,int t,int start,int depth,
+                              int *work,int *best,fe *workv,fe *bestv,
+                              unsigned long *tries) {
+  if(depth==t) {
+    if(++*tries>100000UL) return 0;
+    if(ecp_fit_support(n,k,G,y,work,t,workv)) {
+      memcpy(best,work,(size_t)t*sizeof(int));
+      memcpy(bestv,workv,(size_t)t*sizeof(fe)); return 1;
+    }
+    return 0;
+  }
+  for(int i=start;i<=nc-(t-depth);i++) {
+    work[depth]=cand[i];
+    if(ecp_support_search(n,k,G,y,cand,nc,t,i+1,depth+1,work,best,workv,bestv,tries)) return 1;
+    if(*tries>100000UL) return 0;
+  }
+  return 0;
+}
+
+static int ecp_ag_decode(int n, int M, int g, int t, const fe *received,
+                         int *out_pos, fe *out_val, int *out_n) {
+  if (!received || !out_pos || !out_val || !out_n || t < 0)
+    return 0;
+  int a = t + g;
+  if (M < 2*g-1 || a + M >= n || n - M - a <= t) {
+    printf("# ECP: certified Goppa bounds do not fit (need M+a<n and "
+           "n-M-a>t; M=%d, a=%d, n=%d, t=%d)\n", M, a, n, t);
+    return 0;
+  }
+  int dc = count_basis_upto(M), da = count_basis_upto(a);
+  if (dc != M + 1 - g || da != a + 1 - g || da <= t || dc <= 0) {
+    printf("# ECP: Newton basis dimensions do not match Riemann-Roch "
+           "(dim C=%d expected %d; dim A=%d expected %d)\n",
+           dc, M+1-g, da, a+1-g);
+    return 0;
+  }
+  if ((size_t)da * (size_t)dc * (size_t)n > 20000000u) {
+    puts("# ECP: product-space row cap exceeded in this build");
+    return 0;
+  }
+  fe *P = calloc((size_t)da * dc * n, sizeof(fe));
+  if (!P) return 0;
+  for (int i=0;i<da;i++) for (int j=0;j<dc;j++) {
+    fe *row=P+((size_t)i*dc+j)*n;
+    if (!basis[i].val || !basis[j].val) { free(P); return 0; }
+    for (int x=0;x<n;x++) row[x]=mul(basis[i].val[x],basis[j].val[x]);
+  }
+  fe *B=NULL;
+  int db=nullspace_gf(P, da*dc, n, &B);
+  free(P);
+  if (db <= 0 || !B) { free(B); puts("# ECP: B construction produced no nonzero space"); return 0; }
+  fe *S=calloc((size_t)db*da,sizeof(fe));
+  if (!S) { free(B); return 0; }
+  for (int b=0;b<db;b++) for (int i=0;i<da;i++) {
+    fe acc=0;
+    for (int x=0;x<n;x++) {
+      fe z=mul(mul(B[(size_t)b*n+x],received[x]),basis[i].val[x]);
+      acc ^= z;
+    }
+    S[(size_t)b*da+i]=acc;
+  }
+  fe *K=NULL;
+  int dk=nullspace_gf(S,db,da,&K);
+  free(S); free(B);
+  if (dk <= 0 || !K) { free(K); puts("# ECP: locator kernel is trivial"); return 0; }
+  int nz=0, *cand=malloc(sizeof(int)*(size_t)n);
+  for (int x=0;x<n;x++) {
+    int common=1;
+    for (int q=0;q<dk && common;q++) {
+      fe z=0;
+      for (int i=0;i<da;i++) if (K[(size_t)q*da+i])
+        z ^= mul(K[(size_t)q*da+i],basis[i].val[x]);
+      if (z) common=0;
+    }
+    if (common) cand[nz++]=x;
+  }
+  free(K);
+  if (nz<t || nz>MAXT) { free(cand); printf("# ECP: common-zero candidate set has %d positions for t=%d\n",nz,t); return 0; }
+  fe *C=calloc((size_t)dc*n,sizeof(fe));
+  int *work=malloc(sizeof(int)*(size_t)t), *best=malloc(sizeof(int)*(size_t)t);
+  fe *wv=malloc(sizeof(fe)*(size_t)t), *bv=malloc(sizeof(fe)*(size_t)t);
+  if(!C||!work||!best||!wv||!bv){free(cand);free(C);free(work);free(best);free(wv);free(bv);return 0;}
+  for(int j=0;j<dc;j++) memcpy(C+(size_t)j*n,basis[j].val,sizeof(fe)*(size_t)n);
+  unsigned long tries=0;
+  int found=ecp_support_search(n,dc,C,received,cand,nz,t,0,0,work,best,wv,bv,&tries);
+  free(cand);free(C);free(work);free(wv);
+  if(!found){free(best);free(bv);printf("# ECP: no support passed the codeword consistency check (%lu subsets tested)\n",tries);return 0;}
+  memcpy(out_pos,best,sizeof(int)*(size_t)t); memcpy(out_val,bv,sizeof(fe)*(size_t)t);
+  free(best);free(bv); *out_n=t;
+  printf("# ECP: A=L(%dP) dim=%d, C=L(%dP) dim=%d, B dim=%d; "
+         "bounds d(A)>=%d, d(C)>=%d, d(B^perp)>%d\n",
+         a,da,M,dc,db,n-a,n-M,t);
+  return 1;
+}
+
+static int ag_concat_run(const fe *Gen, const fe *VG, int npts, int kcode,
+                         int rG, int outer_m, const char *inner_spec,
+                         unsigned poly, int trials, int nerr, int verbose,
+                         int showv, int burst, int interleave);
+
 int noize_run(int argc, char **argv) {
-  const char *terms = "16,0;0,1;15,4;12,16", *polespec = NULL;
+  const char *terms = "16,0;0,1;15,4;12,16", *polespec = NULL,
+             *concat_inner = NULL;
   const char *curve_name = "bbgs";
   int len_req = -1, half = 0, q_req = -1, terms_set = 0, m_bits = 6, Mreq = -1,
       bbgs_a = 1, bbgs_b = 2, place_req = -1, trials = 1, verbose = 0,
@@ -6654,14 +6868,15 @@ int noize_run(int argc, char **argv) {
   unsigned poly = 0, seed = 1;
   int run_fr = 1, run_bms = 1, run_vote = 1, run_frvote = 0, only = 0,
       nerr = 256, force = 1, fixed_value_req = 0, run_common_binary = 0,
-      encode_requested = 0;
+      encode_requested = 0, run_ecp = 0, concat_burst = 0,
+      concat_interleave = 1;
   for (int i = 1; i < argc; ++i) {
     { /* accept --force / --fr / --bms / --vote / --basic / --list as well as
          -force ... */
       static const char *flags[] = {
           "half",   "force",  "fr",     "bms",      "vote",   "frvote",
           "basic",  "list",   "v",      "nonewton", "strict", "limits",
-          "nopoly", "forney", "kotter", "encode",   NULL};
+          "nopoly", "forney", "kotter", "encode", "ecp", NULL};
       if (argv[i][0] == '-' && argv[i][1] == '-')
         for (int f = 0; flags[f]; ++f)
           if (!strcmp(argv[i] + 2, flags[f])) {
@@ -6701,6 +6916,20 @@ int noize_run(int argc, char **argv) {
       place_req = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--pole") && i + 1 < argc)
       polespec = argv[++i];
+    else if (!strcmp(argv[i], "--basis") && i + 1 < argc) {
+      const char *b = argv[++i];
+      if (!strcmp(b, "legacy")) multi_newton_order = 0;
+      else if (!strcmp(b, "newton")) multi_newton_order = 1;
+      else { fprintf(stderr, "--basis must be legacy or newton\n"); return 2; }
+    }
+    else if (!strcmp(argv[i], "--concat-inner") && i + 1 < argc) {
+      concat_inner = argv[++i];
+      encode_requested = 1;
+    } else if (!strcmp(argv[i], "--concat-burst")) {
+      concat_burst = 1;
+    } else if (!strcmp(argv[i], "--interleave") && i + 1 < argc) {
+      concat_interleave = atoi(argv[++i]);
+    }
     else if (!strcmp(argv[i], "--Jstep") && i + 1 < argc)
       Jstep = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--Jmax") && i + 1 < argc)
@@ -6739,7 +6968,7 @@ int noize_run(int argc, char **argv) {
       return 0;
     } else if (!strcmp(argv[i], "-fr") || !strcmp(argv[i], "-bms") ||
                !strcmp(argv[i], "-vote") || !strcmp(argv[i], "-frvote") ||
-               !strcmp(argv[i], "-basic")) {
+               !strcmp(argv[i], "-basic") || !strcmp(argv[i], "-ecp")) {
       if (!only)
         run_fr = run_bms = run_vote = run_frvote = 0;
       only = 1;
@@ -6751,6 +6980,8 @@ int noize_run(int argc, char **argv) {
         run_vote = 1;
       else if (!strcmp(argv[i], "-frvote"))
         run_frvote = 1;
+      else if (!strcmp(argv[i], "-ecp"))
+        run_ecp = 1;
     } else if (argv[i][0] == '-') {
       fprintf(stderr, "unknown option: %s  (see --help)\n", argv[i]);
       return 1;
@@ -6764,7 +6995,7 @@ int noize_run(int argc, char **argv) {
   }
   compact_fr_mode = run_frvote;
   if (api_mode &&
-      (polespec != NULL || !run_frvote || run_fr || run_bms || run_vote)) {
+      (polespec != NULL || run_ecp || !run_frvote || run_fr || run_bms || run_vote)) {
     fprintf(stderr, "API mode supports only one-point Newton FR-VOTE; use "
                     "-frvote alone and do not set --pole.\n");
     return 1;
@@ -6884,9 +7115,17 @@ int noize_run(int argc, char **argv) {
       terms = tbuf;
       hermitian_q = q;
       printf("# Hermitian curve: Y^%d + Y + X^%d = 0 (q=%d)\n", q, q + 1, q);
+    } else if (!strcmp(curve_name, "klein")) {
+      /* Klein quartic X^3 Y + Y^3 Z + Z^3 X = 0.
+       * In the affine chart Z=1 this is x^3 y + y^3 + x = 0.
+       * The common curve engine performs its usual model normalisation. */
+      terms = "3,1;0,3;1,0";
+      terms_set = 1; /* run the custom-model normaliser for this affine form */
+      printf("# Klein quartic: X^3 Y + Y^3 Z + Z^3 X = 0\n"
+             "# affine chart Z=1: x^3 y + y^3 + x = 0\n");
     } else {
       fprintf(stderr,
-              "--curve must be bbgs, hermitian or suzuki (or use --terms)\n");
+              "--curve must be bbgs, hermitian, suzuki or klein (or use --terms)\n");
       return 1;
     }
   }
@@ -7013,7 +7252,7 @@ int noize_run(int argc, char **argv) {
              "structure here\n",
              FM, qfam);
   }
-  print_limits(GENUS, npts, nerr);
+  print_limits(GENUS, npts, concat_inner ? 0 : nerr);
   if (only_list)
     return 0;
   /*
@@ -7036,14 +7275,20 @@ int noize_run(int argc, char **argv) {
   if (run_common_binary) {
     run_fr = run_bms = run_vote = run_frvote = 0;
   }
-  if (nerr < 1 || nerr > MAXT - 2) {
-    fprintf(stderr, "--errors out of range (1..%d)\n", MAXT - 2);
+  if (nerr < 1 || (!concat_inner && nerr > MAXT - 2)) {
+    if (concat_inner)
+      fprintf(stderr, "--errors must be positive for concatenation\n");
+    else
+      fprintf(stderr, "--errors out of range (1..%d)\n", MAXT - 2);
     return 1;
   }
   int mult[MAXORB];
   memset(mult, 0, sizeof mult);
 
   /* ===================== choose the code ===================== */
+  /* Multi-point construction is opt-in only.  The default path is the
+   * one-point Newton-polygon basis; never silently switch algorithms merely
+   * because this curve has no Newton-certifiable rational pole. */
   int multi = (polespec != NULL);
   int nvirt = 0;
   if (use_newton)
@@ -7051,27 +7296,14 @@ int noize_run(int argc, char **argv) {
       if (!ed[k].inf && ed[k].len == 1)
         nvirt++;
   if (!multi && nrat == 0 && nvirt == 0) {
-    multi = 1;
-    printf("# no rational place at infinity: no one-point code with a pole at "
-           "a rational point on this model.\n"
-           "# fallback: multi-point divisor supported on the lowest-degree "
-           "Galois orbit, decoded by the basic algorithm.\n");
-  } else if (!multi && place_req < 0 && use_newton &&
-             !any_newton_place(GENUS)) {
-    /* rational places exist, but none lies on a primitive edge whose
-     * Riemann-Roch space the Newton engine can certify (e.g. all points at
-     * infinity share an edge of lattice length > 1, or several places at
-     * infinity constrain the monomials).  Do not give up: the multi-point
-     * path computes L(G) from Laurent expansions and works on any such
-     * model. */
-    multi = 1;
-    printf("# no one-point place on this model can be certified by the Newton "
-           "engine.\n"
-           "# fallback: multi-point divisor supported on the lowest-degree "
-           "Galois orbit at infinity, decoded by the basic algorithm "
-           "(t <= (deg G - 3g + 1)/2).\n");
+    fprintf(stderr,
+            "ERROR: no rational one-point place is available for the Newton "
+            "basis on this curve.\n"
+            "       Multi-point construction is opt-in; specify --pole "
+            "explicitly to use it.\n");
+    return 1;
   }
-  if (encode_requested && !multi) {
+  if (encode_requested && !multi && !concat_inner) {
     fprintf(stderr, "ERROR: -encode is available only for the multi-point "
                     "-basic path (use --pole).\n");
     return 1;
@@ -7080,6 +7312,10 @@ int noize_run(int argc, char **argv) {
   if (multi) {
     /* ---------- multi-point: basic Niederreiter syndrome decoding ----------
      */
+    /* For concatenation, nerr counts binary channel errors, not AG-symbol
+       errors.  The AG divisor only needs to support the outer parity-check
+       construction; do not size its Riemann--Roch split using bit errors. */
+    int ag_t = concat_inner ? 0 : nerr;
     int degG = 0;
     if (polespec) {
       char *s = strdup(polespec), *tok = strtok(s, ",");
@@ -7123,24 +7359,26 @@ int noize_run(int argc, char **argv) {
       for (int q = 1; q < ng_orb; ++q)
         if (pl[q].d < pl[best].d)
           best = q;
-      int need = 2 * nerr + 3 * GENUS + 4;
+      int need = 2 * ag_t + 3 * GENUS + 4;
       mult[best] = (need + pl[best].d - 1) / pl[best].d;
     }
     for (int q = 0; q < ng_orb; ++q)
       degG += mult[q] * pl[q].d;
-    int need = 2 * nerr + 3 * GENUS - 1;
+    int need = 2 * ag_t + 3 * GENUS - 1;
     printf("# multi-point divisor G: deg G = %d, designed distance >= %d; "
-           "basic algorithm needs deg G >= %d for t = %d\n",
-           degG, degG - 2 * GENUS + 2, need, nerr);
+           "%s needs deg G >= %d for t = %d\n",
+           degG, degG - 2 * GENUS + 2,
+           concat_inner ? "AG/Goppa outer construction" : "basic algorithm",
+           need, ag_t);
     if (degG < need) {
       fprintf(
           stderr,
-          "deg G too small for %d errors with the basic algorithm (tau = %d)\n",
-          nerr, (degG - 3 * GENUS + 1) / 2);
+          "deg G too small for %d AG errors with the basic algorithm (tau = %d)\n",
+          ag_t, (degG - 3 * GENUS + 1) / 2);
       return 1;
     }
     /* split G = F + H with deg F >= t+g and deg H >= t+2g-1 */
-    int lo = nerr + GENUS, hi = degG - nerr - 2 * GENUS + 1,
+    int lo = ag_t + GENUS, hi = degG - ag_t - 2 * GENUS + 1,
         target = (lo + hi) / 2;
     int fm[MAXORB], hm[MAXORB], degF = 0;
     for (int q = 0; q < ng_orb; ++q) {
@@ -7169,7 +7407,7 @@ int noize_run(int argc, char **argv) {
     }
     printf("# splitting G = F + H: deg F = %d (>= t+g = %d), deg H = %d (>= "
            "t+2g-1 = %d)\n",
-           degF, lo, degG - degF, nerr + 2 * GENUS - 1);
+           degF, lo, degG - degF, ag_t + 2 * GENUS - 1);
     LSp LG = {0}, LF = {0}, LH = {0};
     double t0 = now();
     if (solve_L(mult, -1, Jstep, Jmax, 0, &LG) != 0) {
@@ -7287,6 +7525,20 @@ int noize_run(int argc, char **argv) {
             free(VH);
             return 1;
           }
+    }
+    if (concat_inner) {
+      int rc = ag_concat_run(Gen, VG, npts, kcode, rG, m_bits,
+                             concat_inner, poly, trials, nerr, verbose,
+                             show_values, concat_burst, concat_interleave);
+      free(Gen);
+      free(R0);
+      free(LG.B);
+      free(LF.B);
+      free(LH.B);
+      free(VG);
+      free(VF);
+      free(VH);
+      return rc;
     }
     printf("# code: n = %d, check rows = %d, k = %d, designed distance >= %d, "
            "setup %.2f s\n",
@@ -7445,6 +7697,25 @@ int noize_run(int argc, char **argv) {
 
   /* ---------- one-point codes ---------- */
   int M = Mreq;
+  if (concat_inner && M <= 0) {
+    /* For a one-point concatenated outer code, leave 2g+1 parity checks
+     * (Riemann--Roch gives k=M+1-g).  This is a conservative default with
+     * useful erasure capacity; users may tune it explicitly with --M. */
+    M = npts - GENUS - 2;
+    if (M < 2 * GENUS - 1) {
+      fprintf(stderr,
+              "ERROR: one-point AG/Goppa concatenation needs more rational "
+              "evaluation points: n=%d, g=%d; default M=%d is below "
+              "2g-1=%d. Increase the field/point count or use --pole for "
+              "the optional multi-point construction.\n",
+              npts, GENUS, M, 2 * GENUS - 1);
+      return 1;
+    }
+    printf("# one-point concatenation default: M=%d (outer parity checks "
+           "about %d)\n", M, npts - (M + 1 - GENUS));
+  }
+  if (run_ecp && M <= 0)
+    M = 2 * GENUS; /* choose the smallest one-point divisor for ECP bounds */
   if (M <= 0) {
     /* default: the smallest M for which FR/BMS (basic bound) AND voting all
      * correct nerr errors; if that does not fit, the voting minimum */
@@ -7473,16 +7744,22 @@ int noize_run(int argc, char **argv) {
     print_limits(GENUS, npts, nerr);
     return 1;
   }
-  if (nerr > TAU_V && !run_common_binary) {
+  if (!concat_inner && nerr > TAU_V && !run_common_binary && !run_ecp) {
     fprintf(stderr,
             "%d errors exceed tau_vote = %d for M = %d (need M >= %d)\n", nerr,
             TAU_V, M, 2 * nerr + 2 * GENUS);
     print_limits(GENUS, npts, nerr);
     return 1;
   }
-  printf("# one-point code: M = %d, g = %d, basic algorithm t <= %d, with "
-         "majority voting t <= %d\n",
-         M, GENUS, TAU, TAU_V);
+  if (concat_inner)
+    printf("# one-point AG/Goppa outer setup: M = %d, g = %d\n", M, GENUS);
+  else if (run_ecp)
+    printf("# one-point code: M = %d, g = %d, ECP requested for t = %d\n",
+           M, GENUS, NUM_ERRORS);
+  else
+    printf("# one-point code: M = %d, g = %d, basic algorithm t <= %d, with "
+           "majority voting t <= %d\n",
+           M, GENUS, TAU, TAU_V);
   if (npts <= M_EXT) {
     fprintf(stderr,
             "# the curve has only n = %d rational points, but M + g = %d >= n: "
@@ -7666,7 +7943,7 @@ int noize_run(int argc, char **argv) {
       }
     }
     nbasis = B->n;
-    if (run_frvote) {
+    if (run_frvote && !concat_inner) {
       /* FR-VOTE's Newton syndrome path only needs monomial exponents and
        * point coordinates.  Do not allocate nbasis*npts field elements;
        * selected error positions are evaluated on demand. */
@@ -7717,6 +7994,93 @@ int noize_run(int argc, char **argv) {
       free(ord);
     }
   }
+  if (concat_inner) {
+    /* Build the one-point outer AG code directly from the Newton monomials
+     * with pole order <= M.  Its parity-check matrix is the nullspace of the
+     * evaluation generator matrix.  This is deliberately separate from the
+     * multi-point divisor path; no silent algorithm switch is performed. */
+    int kcode = 0;
+    for (int i = 0; i < nbasis; ++i)
+      if (basis[i].rho <= M)
+        kcode++;
+    int expected_k = M + 1 - GENUS;
+    if (kcode != expected_k || kcode <= 0 || kcode >= npts) {
+      fprintf(stderr,
+              "ERROR: one-point AG basis dimension mismatch: got k=%d, "
+              "Riemann-Roch expects %d (M=%d, g=%d).\n"
+              "       This curve/place does not provide a certified "
+              "one-point Newton basis for the requested divisor.\n",
+              kcode, expected_k, M, GENUS);
+      return 2;
+    }
+    fe *Gen = calloc((size_t)kcode * npts, sizeof(fe));
+    if (!Gen) {
+      fprintf(stderr, "ERROR: out of memory constructing one-point AG generator\n");
+      return 2;
+    }
+    int gr = 0;
+    for (int i = 0; i < nbasis; ++i) {
+      if (basis[i].rho > M)
+        continue;
+      if (!basis[i].val) {
+        fprintf(stderr, "ERROR: Newton evaluation row %d was not materialized\n", i);
+        free(Gen);
+        return 2;
+      }
+      memcpy(Gen + (size_t)gr * npts, basis[i].val,
+             sizeof(fe) * (size_t)npts);
+      gr++;
+    }
+    fe *Gwork = malloc(sizeof(fe) * (size_t)kcode * npts);
+    fe *VG = NULL;
+    if (!Gwork) {
+      free(Gen);
+      fprintf(stderr, "ERROR: out of memory constructing one-point parity checks\n");
+      return 2;
+    }
+    memcpy(Gwork, Gen, sizeof(fe) * (size_t)kcode * npts);
+    int rG = nullspace_gf(Gwork, kcode, npts, &VG);
+    free(Gwork);
+    if (rG != npts - kcode || !VG) {
+      fprintf(stderr,
+              "ERROR: one-point AG evaluation matrix rank failure: "
+              "nullity=%d, expected %d.\n"
+              "       The selected evaluation points may not be injective "
+              "or the Newton basis may be incomplete.\n",
+              rG, npts - kcode);
+      free(Gen);
+      free(VG);
+      return 2;
+    }
+    for (int h = 0; h < rG; ++h)
+      for (int j = 0; j < kcode; ++j)
+        if (dotv(VG + (size_t)h * npts,
+                 Gen + (size_t)j * npts, npts)) {
+          fprintf(stderr,
+                  "ERROR: one-point AG parity-check validation failed "
+                  "at row %d, generator %d\n", h, j);
+          free(Gen);
+          free(VG);
+          return 2;
+        }
+    printf("# one-point AG outer code: [n=%d,k=%d,r=%d] over GF(2^%d), "
+           "Newton basis; designed distance >= %d\n",
+           npts, kcode, rG, m_bits, npts - M);
+    int rc = ag_concat_run(Gen, VG, npts, kcode, rG, m_bits,
+                           concat_inner, poly, trials, nerr, verbose,
+                           show_values, concat_burst, concat_interleave);
+    free(Gen);
+    free(VG);
+    for (int i = 0; i < nbasis; ++i)
+      free(basis[i].val);
+    if (via_newton[best]) {
+      free(NB[best].rho);
+      free(NB[best].ei);
+      free(NB[best].ej);
+    }
+    return rc;
+  }
+
   init_semigroup();
   ASHIFT = basis[1].rho;
   ROW_MAX = M_SYND - ASHIFT;
@@ -7736,7 +8100,7 @@ int noize_run(int argc, char **argv) {
            now() - t0);
   }
   fe *r = malloc(sizeof(fe) * npts);
-  int cnt_fr = 0, cnt_bms = 0, cnt_vote = 0, cnt_frvote = 0;
+  int cnt_fr = 0, cnt_bms = 0, cnt_vote = 0, cnt_frvote = 0, cnt_ecp = 0;
   int quiet = trials > 1;
   for (int tr = 0; tr < trials; ++tr) {
     if (api_mode) {
@@ -7806,6 +8170,19 @@ int noize_run(int argc, char **argv) {
            "(expected to "
            "fail)");
     int okf = 1, okb = 1, okv = 1, okfv = 1;
+    int okecp = 1;
+    if (run_ecp) {
+      int ep[MAXT], en=0; fe ev[MAXT];
+      double te=now();
+      okecp=ecp_ag_decode(npts,M,GENUS,NUM_ERRORS,recv,ep,ev,&en);
+      int same=0;
+      if (okecp) for (int q=0;q<en;q++) for (int e=0;e<NUM_ERRORS;e++)
+        if (ep[q]==true_pos[e] && ev[q]==true_val[e]) same++;
+      okecp = okecp && en==NUM_ERRORS && same==NUM_ERRORS;
+      cnt_ecp += okecp;
+      if (!quiet) printf("# ECP  %d of %d errors recovered with correct values -> %s (%.3f s)\n",
+                         same,NUM_ERRORS,okecp?"OK":"FAILED",now()-te);
+    }
     if (run_frvote) {
       decode_fr_vote(&res_frvote, verbose, quiet);
       okfv = verify("FR-VOTE", &res_frvote, quiet);
@@ -7879,6 +8256,8 @@ int noize_run(int argc, char **argv) {
              run_vote ? (okv ? "ok" : "FAIL") : "n/a");
       if (run_frvote)
         printf("# trial %d: FR-VOTE %s\n", tr + 1, okfv ? "ok" : "FAIL");
+      if (run_ecp)
+        printf("# trial %d: ECP %s\n", tr + 1, okecp ? "ok" : "FAIL");
     }
   }
   if (trials > 1) {
@@ -7900,6 +8279,8 @@ int noize_run(int argc, char **argv) {
            trials, NUM_ERRORS, sf, sb, sv);
     if (run_frvote)
       printf("# FR-VOTE: %d/%d\n", cnt_frvote, trials);
+    if (run_ecp)
+      printf("# ECP: %d/%d\n", cnt_ecp, trials);
   }
   if (via_newton[best])
     free(NB[best].rho); /* ei/ej stay referenced by bas_ei/bas_ej */
@@ -8781,6 +9162,35 @@ typedef struct {
   uint8_t *gsys; /* RM: systematic generator, k rows of n bytes */
 } BinCode;
 
+/* Release a binary-code object and all storage it owns.  For alternant/Goppa
+   objects B->info aliases A->info, so that array is freed exactly once. */
+static void bc_free(BinCode *B) {
+  if (!B) return;
+  if (B->alt) {
+    AltCode *A = B->alt;
+    if (A->F) {
+      free(A->F->exp);
+      free(A->F->log);
+      free(A->F);
+    }
+    free(A->al);
+    free(A->y);
+    free(A->invG2);
+    free(A->rb);
+    free(A->val);
+    free(A->pos);
+    free(A->info);
+    free(A->gen);
+    free(A);
+  } else {
+    free(B->info);
+  }
+  free(B->gtab);
+  free(B->mon);
+  free(B->gsys);
+  free(B);
+}
+
 static BinCode *bc_from_alt(AltCode *A, const char *name, int t) {
   BinCode *B = calloc(1, sizeof *B);
   snprintf(B->name, sizeof B->name, "%s", name);
@@ -9647,8 +10057,114 @@ static void run_bincode(const BinCode *B, int trials, int nerr, int nera,
 }
 
 /* ---- GRS ---- */
+static int ecp_gf_nullspace(const GF *F, fe *A, int E, int K, fe **out) {
+  int *pc=malloc(sizeof(int)*(size_t)K), rk=0;
+  if(!pc) return -1;
+  for(int c=0;c<K && rk<E;c++) {
+    int p=rk; while(p<E && !A[(size_t)p*K+c]) p++;
+    if(p==E) continue;
+    if(p!=rk) for(int j=0;j<K;j++){fe z=A[(size_t)p*K+j];A[(size_t)p*K+j]=A[(size_t)rk*K+j];A[(size_t)rk*K+j]=z;}
+    fe iv=ginv(F,A[(size_t)rk*K+c]);
+    for(int j=c;j<K;j++) A[(size_t)rk*K+j]=gmul(F,A[(size_t)rk*K+j],iv);
+    for(int q=rk+1;q<E;q++) {
+      fe f=A[(size_t)q*K+c]; if(!f) continue;
+      for(int j=c;j<K;j++) A[(size_t)q*K+j]^=gmul(F,f,A[(size_t)rk*K+j]);
+    }
+    pc[rk++]=c;
+  }
+  unsigned char *isp=calloc((size_t)K,1);
+  for(int i=0;i<rk;i++) isp[pc[i]]=1;
+  int dim=K-rk; fe *B=calloc((size_t)(dim?dim:1)*K,sizeof(fe));
+  if(!isp||!B){free(pc);free(isp);free(B);return -1;}
+  int bi=0;
+  for(int f=0;f<K;f++) if(!isp[f]) {
+    fe *x=B+(size_t)bi*K; x[f]=1;
+    for(int i=rk-1;i>=0;i--) {
+      int c=pc[i]; fe z=0;
+      for(int j=c+1;j<K;j++) if(A[(size_t)i*K+j]&&x[j]) z^=gmul(F,A[(size_t)i*K+j],x[j]);
+      x[c]=z;
+    }
+    bi++;
+  }
+  free(pc);free(isp);*out=B;return dim;
+}
+static int ecp_gf_fit_support(const GF *F,int n,int k,const fe *G,const fe *y,
+                              const int *support,int ns,fe *err) {
+  int rows=n-ns,W=k+1;if(rows<k)return 0;
+  fe *A=calloc((size_t)rows*W,sizeof(fe));int *pc=malloc(sizeof(int)*(size_t)k);
+  if(!A||!pc){free(A);free(pc);return 0;}
+  int rr=0;
+  for(int p=0;p<n;p++){int skip=0;for(int q=0;q<ns;q++)if(support[q]==p){skip=1;break;}if(skip)continue;
+    for(int j=0;j<k;j++) A[(size_t)rr*W+j]=G[(size_t)j*n+p];
+    A[(size_t)rr*W+k]=y[p]; rr++;}
+  int rank=0;
+  for(int c=0;c<k;c++){int p=rank;while(p<rows&&!A[(size_t)p*W+c])p++;if(p==rows){free(A);free(pc);return 0;}
+    if(p!=rank)for(int j=c;j<W;j++){fe z=A[(size_t)p*W+j];A[(size_t)p*W+j]=A[(size_t)rank*W+j];A[(size_t)rank*W+j]=z;}
+    fe iv=ginv(F,A[(size_t)rank*W+c]);for(int j=c;j<W;j++)A[(size_t)rank*W+j]=gmul(F,A[(size_t)rank*W+j],iv);
+    for(int q=0;q<rows;q++)if(q!=rank){fe f=A[(size_t)q*W+c];if(!f)continue;for(int j=c;j<W;j++)A[(size_t)q*W+j]^=gmul(F,f,A[(size_t)rank*W+j]);}
+    pc[rank++]=c;}
+  for(int q=k;q<rows;q++)if(A[(size_t)q*W+k]){free(A);free(pc);return 0;}
+  fe *msg=calloc((size_t)k,sizeof(fe));if(!msg){free(A);free(pc);return 0;}
+  for(int q=0;q<k;q++)msg[pc[q]]=A[(size_t)q*W+k];
+  for(int q=0;q<ns;q++){int p=support[q];fe cw=0;for(int j=0;j<k;j++)if(msg[j])cw^=gmul(F,msg[j],G[(size_t)j*n+p]);err[q]=y[p]^cw;if(!err[q]){free(A);free(pc);free(msg);return 0;}}
+  free(A);free(pc);free(msg);return 1;
+}
+static int ecp_gf_support_rec(const GF *F,int n,int k,const fe *G,const fe *y,
+ const int *cand,int nc,int t,int start,int depth,int *work,int *best,fe *wv,fe *bv,unsigned long *tries){
+  if(depth==t){if(++*tries>100000UL)return 0;if(ecp_gf_fit_support(F,n,k,G,y,work,t,wv)){memcpy(best,work,(size_t)t*sizeof(int));memcpy(bv,wv,(size_t)t*sizeof(fe));return 1;}return 0;}
+  for(int i=start;i<=nc-(t-depth);i++){work[depth]=cand[i];if(ecp_gf_support_rec(F,n,k,G,y,cand,nc,t,i+1,depth+1,work,best,wv,bv,tries))return 1;if(*tries>100000UL)return 0;}return 0;
+}
+
+static int ecp_grs_decode(GRS *G, const fe *received, int t) {
+  int n=G->n,k=G->k;
+  if (t<0 || 2*t>n-k) return -1;
+  int da=t+1, *cand=malloc(sizeof(int)*(size_t)n);
+  fe *S=calloc((size_t)(t?t:1)*da,sizeof(fe)), *K=NULL;
+  if(!cand||!S){free(cand);free(S);return -1;}
+  for(int j=0;j<t;j++) for(int l=0;l<da;l++) {
+    fe acc=0;
+    for(int i=0;i<n;i++) {
+      fe pw=1;
+      for(int z=0;z<j+l;z++) pw=gmul(G->F,pw,G->al[i]);
+      acc ^= gmul(G->F,gmul(G->F,G->y[i],received[i]),pw);
+    }
+    S[(size_t)j*da+l]=acc;
+  }
+  int dk=ecp_gf_nullspace(G->F,S,t,da,&K); free(S);
+  if(dk<=0||!K){free(K);free(cand);return -1;}
+  int nc=0;
+  for(int i=0;i<n;i++) {
+    int common=1;
+    for(int q=0;q<dk&&common;q++) {
+      fe z=0;
+      for(int l=0;l<da;l++) if(K[(size_t)q*da+l]) {
+        fe pw=1; for(int h=0;h<l;h++) pw=gmul(G->F,pw,G->al[i]);
+        z ^= gmul(G->F,K[(size_t)q*da+l],pw);
+      }
+      if(z) common=0;
+    }
+    if(common) cand[nc++]=i;
+  }
+  free(K);
+  fe *CG=calloc((size_t)k*n,sizeof(fe));
+  int *work=malloc(sizeof(int)*(size_t)(t?t:1)),*best=malloc(sizeof(int)*(size_t)(t?t:1));
+  fe *wv=malloc(sizeof(fe)*(size_t)(t?t:1)),*bv=malloc(sizeof(fe)*(size_t)(t?t:1));
+  if(!CG||!work||!best||!wv||!bv){free(cand);free(CG);free(work);free(best);free(wv);free(bv);return -1;}
+  for(int j=0;j<k;j++) for(int i=0;i<n;i++) {
+    fe pw=1; for(int h=0;h<j;h++) pw=gmul(G->F,pw,G->al[i]);
+    CG[(size_t)j*n+i]=gmul(G->F,G->v[i],pw);
+  }
+  unsigned long tries=0;
+  int found=(nc>=t)&&ecp_gf_support_rec(G->F,n,k,CG,received,cand,nc,t,0,0,work,best,wv,bv,&tries);
+  free(cand);free(CG);free(work);free(wv);
+  if(!found){free(best);free(bv);return -1;}
+  for(int q=0;q<t;q++){G->pos[q]=best[q];G->val[q]=bv[q];}
+  G->found=t;
+  free(best);free(bv);return t;
+}
+
 static void run_grs(GRS *G, int trials, int nerr, int nera, int verbose,
-                    int showv) {
+                    int showv, int use_ecp) {
   int n = G->n, k = G->k;
   const GF *F = G->F;
   fe *msg = malloc(sizeof(fe) * (size_t)k),
@@ -9663,6 +10179,10 @@ static void run_grs(GRS *G, int trials, int nerr, int nera, int verbose,
   int quiet = trials > 1 && !verbose;
   if (nerr + nera > n)
     die("too many errors/erasures for n=%d", n);
+  if (use_ecp && nera)
+    die("ECP mode currently handles errors only; --erasures is not supported");
+  if (use_ecp && 2*nerr > n-k)
+    die("ECP conditions require 2*errors <= n-k (got %d > %d)",2*nerr,n-k);
   for (int tr = 0; tr < trials; ++tr) {
     for (int j = 0; j < k; ++j)
       msg[j] = (fe)(rnd() % (uint64_t)F->size);
@@ -9684,7 +10204,11 @@ static void run_grs(GRS *G, int trials, int nerr, int nera, int verbose,
       rv[xp[e]] = (fe)(rnd() % (uint64_t)F->size); /* garbage, ignored */
     }
     t0 = now();
-    int res = grs_decode(G, rv, nera ? era : NULL, out);
+    int res = use_ecp ? ecp_grs_decode(G,rv,nerr) : grs_decode(G, rv, nera ? era : NULL, out);
+    if (use_ecp && res >= 0) {
+      memcpy(out,rv,sizeof(fe)*(size_t)n);
+      for(int q=0;q<G->found;q++) out[G->pos[q]] ^= G->val[q];
+    }
     st.t_dec += now() - t0;
     int cls = res < 0 ? 1 : (memcmp(out, cw, sizeof(fe) * (size_t)n) ? 2 : 0);
     if (cls == 0) {
@@ -9694,8 +10218,8 @@ static void run_grs(GRS *G, int trials, int nerr, int nera, int verbose,
     }
     stat_add(&st, cls);
     if (!quiet) {
-      printf("# trial %d: %d errors + %d erasures -> %s", tr + 1, nerr, nera,
-             cls_name(cls));
+      printf("# trial %d: %d errors + %d erasures -> %s%s", tr + 1, nerr, nera,
+             cls_name(cls), use_ecp ? " (ECP)" : "");
       if (res >= 0)
         printf(", %d error values found", res);
       putchar('\n');
@@ -9970,6 +10494,329 @@ static void run_concat(GRS *G, const BinCode *In, int trials, int nerr,
   stat_print(&st, what);
 }
 
+/* Rank of the erased-column submatrix H_E, used only for diagnostics. */
+static int ag_erasure_rank(const fe *VG, int rG, const int *Z, int nz) {
+  if (nz == 0) return 0;
+  fe *A = malloc(sizeof(fe) * (size_t)rG * (size_t)nz);
+  if (!A) return -1;
+  for (int i = 0; i < rG; ++i)
+    for (int j = 0; j < nz; ++j)
+      A[(size_t)i * nz + j] = VG[(size_t)i * npts + Z[j]];
+  int rank = 0;
+  for (int c = 0; c < nz && rank < rG; ++c) {
+    int p = rank;
+    while (p < rG && !A[(size_t)p * nz + c]) ++p;
+    if (p == rG) continue;
+    if (p != rank)
+      for (int j = c; j < nz; ++j) {
+        fe t = A[(size_t)p * nz + j];
+        A[(size_t)p * nz + j] = A[(size_t)rank * nz + j];
+        A[(size_t)rank * nz + j] = t;
+      }
+    fe iv = inv(A[(size_t)rank * nz + c]);
+    for (int j = c; j < nz; ++j)
+      A[(size_t)rank * nz + j] = mul(A[(size_t)rank * nz + j], iv);
+    for (int i = rank + 1; i < rG; ++i) {
+      fe f = A[(size_t)i * nz + c];
+      if (!f) continue;
+      for (int j = c; j < nz; ++j)
+        A[(size_t)i * nz + j] ^= mul(f, A[(size_t)rank * nz + j]);
+    }
+    ++rank;
+  }
+  free(A);
+  return rank;
+}
+
+/* ---- AG outer code concatenated with a binary Goppa inner code ----
+ * Each GF(2^m) outer symbol is mapped to its m binary coordinates, with
+ * remaining inner information coordinates shortened to zero.  Failed inner
+ * decodes become symbol erasures.  The AG parity-check matrix then solves
+ * H_E * e_E = H * y, uniquely when the erased columns have full rank.
+ */
+static int ag_concat_run(const fe *Gen, const fe *VG, int npts, int kcode,
+                         int rG, int outer_m, const char *inner_spec,
+                         unsigned poly, int trials, int nerr, int verbose,
+                         int showv, int burst, int interleave) {
+  int spec_m = 0;
+  if (!inner_spec || sscanf(inner_spec, "goppa:%d", &spec_m) != 1) {
+    fprintf(stderr, "ERROR: AG concatenation requires --concat-inner goppa:m:t[:n].\n");
+    return 2;
+  }
+  if (spec_m != outer_m) {
+    fprintf(stderr, "ERROR: inner Goppa field degree m=%d does not match AG outer field degree m=%d.\n", spec_m, outer_m);
+    return 2;
+  }
+  BinCode *In = bc_parse(inner_spec, poly);
+  if (In->kind != BC_GOPPA) {
+    fprintf(stderr, "ERROR: AG concatenation currently requires a binary Goppa inner code (goppa:m:t[:n]).\n");
+    bc_free(In);
+    return 2;
+  }
+  if (!In->alt || !In->info || In->k < outer_m) {
+    fprintf(stderr, "ERROR: inner Goppa dimension k=%d must be >= outer field degree m=%d.\n", In->k, outer_m);
+    bc_free(In);
+    return 2;
+  }
+  if (npts <= 0 || kcode <= 0 || rG <= 0 || kcode + rG != npts)
+    die("invalid AG generator/parity-check dimensions for concatenation");
+  long long total64 = (long long)npts * In->n;
+  if (total64 > 200000000LL || total64 > 2147483647LL)
+    die("concatenated block length is too large for this build");
+  int total = (int)total64, ni = In->n, m = outer_m;
+  if (nerr < 0 || nerr > total)
+    die("--errors must be in 0..%d for this concatenated code", total);
+  if (interleave < 1 || interleave > 256)
+    die("--interleave must be in 1..256 (1 disables interleaving)");
+  if (interleave > npts)
+    interleave = npts;
+  if (burst && nerr > ni * interleave)
+    die("--concat-burst requires --errors <= %d bits in the first interleaver group", ni * interleave);
+  fe *msg = calloc((size_t)kcode, sizeof(fe));
+  fe *cw = calloc((size_t)npts, sizeof(fe));
+  fe *received = calloc((size_t)npts, sizeof(fe));
+  fe *sigma = calloc((size_t)rG, sizeof(fe));
+  fe *erasval = calloc((size_t)npts, sizeof(fe));
+  int *erasures = malloc(sizeof(int) * (size_t)npts);
+  int *near_candidates = malloc(sizeof(int) * (size_t)npts);
+  int *inner_corr = calloc((size_t)npts, sizeof(int));
+  uint8_t *bits = malloc((size_t)total);       /* block-major encoded bits */
+  uint8_t *txbits = malloc((size_t)total);     /* transmitted/interleaved bits */
+  uint8_t *work = malloc((size_t)ni);          /* one deinterleaved block */
+  uint8_t *reenc = malloc((size_t)ni);         /* codeword validation scratch */
+  size_t ik = (size_t)(In->k > 0 ? In->k : 0);
+  uint8_t *ib = calloc(ik, 1);
+  uint8_t *dec = malloc((size_t)ni);
+  int *ep = malloc(sizeof(int) * (size_t)(nerr ? nerr : 1));
+  if (!msg || !cw || !received || !sigma || !erasval || !erasures ||
+      !bits || !txbits || !work || !reenc || !ib || !dec || !ep ||
+      !near_candidates || !inner_corr)
+    die("out of memory in AG/Goppa concatenation");
+  int successes = 0, detected = 0, miscorrected = 0;
+  int sum_erasures = 0, max_erasures = 0, rank_deficient = 0, inconsistent = 0;
+  int inner_decode_failures = 0, retry_recoveries = 0, retry_added = 0;
+  double enc_total = 0.0, dec_total = 0.0;
+  printf("# concatenated code: outer AG[n=%d,k=%d] over GF(2^%d), inner %s\n",
+         npts, kcode, m, In->name);
+  printf("# binary length N=%d, dimension K=%d, inner correction radius t=%d; interleave depth D=%d\n",
+         total, kcode * m, In->t, interleave);
+  printf("# outer erasure capacity is determined by rank of the erased columns of H\n");
+  for (int tr = 0; tr < trials; ++tr) {
+    for (int j = 0; j < kcode; ++j)
+      msg[j] = (fe)(rnd() % (uint64_t)FS);
+    double t0 = now();
+    memset(cw, 0, sizeof(fe) * (size_t)npts);
+    for (int j = 0; j < kcode; ++j)
+      if (msg[j])
+        for (int x = 0; x < npts; ++x)
+          cw[x] ^= mul(msg[j], Gen[(size_t)j * npts + x]);
+    for (int x = 0; x < npts; ++x) {
+      memset(ib, 0, ik);
+      for (int b = 0; b < m; ++b)
+        ib[b] = (uint8_t)((cw[x] >> b) & 1);
+      bc_encode(In, ib, bits + (size_t)x * ni);
+    }
+    /* Matrix-transpose interleaver: D adjacent codewords are written
+       column-wise, so a contiguous channel burst is spread over D blocks. */
+    if (interleave == 1) {
+      memcpy(txbits, bits, (size_t)total);
+    } else {
+      for (int base = 0; base < npts; base += interleave) {
+        int width = npts - base;
+        if (width > interleave) width = interleave;
+        size_t txbase = (size_t)base * ni;
+        for (int j = 0; j < ni; ++j)
+          for (int b = 0; b < width; ++b)
+            txbits[txbase + (size_t)j * width + b] =
+                bits[(size_t)(base + b) * ni + j];
+      }
+    }
+    enc_total += now() - t0;
+    if (nerr) {
+      if (burst) {
+        int span = ni * (interleave == 1 ? 1 : interleave);
+        if (nerr > span) die("burst exceeds first interleaver group");
+        int start = (int)(rnd() % (uint64_t)(span - nerr + 1));
+        for (int e = 0; e < nerr; ++e) ep[e] = start + e;
+      } else {
+        pick(total, nerr, ep, NULL);
+      }
+    }
+    for (int e = 0; e < nerr; ++e)
+      txbits[ep[e]] ^= 1;
+    /* Deinterleave before the inner decoders. */
+    if (interleave == 1) {
+      memcpy(bits, txbits, (size_t)total);
+    } else {
+      for (int base = 0; base < npts; base += interleave) {
+        int width = npts - base;
+        if (width > interleave) width = interleave;
+        size_t txbase = (size_t)base * ni;
+        for (int j = 0; j < ni; ++j)
+          for (int b = 0; b < width; ++b)
+            bits[(size_t)(base + b) * ni + j] =
+                txbits[txbase + (size_t)j * width + b];
+      }
+    }
+    t0 = now();
+    int nera = 0, ncand = 0;
+    memset(inner_corr, 0, sizeof(int) * (size_t)npts);
+    for (int x = 0; x < npts; ++x) {
+      memcpy(work, bits + (size_t)x * ni, (size_t)ni);
+      int dr = bc_decode(In, work, NULL, dec);
+      int valid = dr >= 0;
+      inner_corr[x] = dr;
+      fe sym = 0;
+      if (valid) {
+        /* bc_decode returns the corrected codeword. Read its systematic
+           information positions and enforce the shortened zero tail. */
+        for (int b = 0; b < In->k; ++b) {
+          uint8_t v = dec[In->info[b]] & 1;
+          if (b < m)
+            sym |= (fe)(v << b);
+          else if (v)
+            valid = 0;
+        }
+        if (valid) {
+          /* Re-encode and compare to reject any decoder output that is not
+             a valid codeword under the actual Goppa encoder. */
+          memset(ib, 0, ik);
+          for (int b = 0; b < In->k; ++b)
+            ib[b] = dec[In->info[b]] & 1;
+          bc_encode(In, ib, reenc);
+          if (memcmp(reenc, dec, (size_t)ni) != 0)
+            valid = 0;
+        }
+      }
+      if (!valid) {
+        inner_decode_failures++;
+        erasures[nera++] = x;
+        received[x] = 0;
+      } else {
+        received[x] = sym;
+        if (dr == In->t) near_candidates[ncand++] = x;
+      }
+    }
+    sum_erasures += nera;
+    if (nera > max_erasures) max_erasures = nera;
+    memset(sigma, 0, sizeof(fe) * (size_t)rG);
+    for (int s = 0; s < rG; ++s)
+      sigma[s] = dotv(VG + (size_t)s * npts, received, npts);
+    int solved = 1;
+    if (nera) {
+      if (nera > rG) {
+        solved = 0;
+        ++rank_deficient;
+      } else if (!solve_values(VG, rG, sigma, erasures, nera, erasval)) {
+        solved = 0;
+        int erank = ag_erasure_rank(VG, rG, erasures, nera);
+        if (erank >= 0 && erank < nera) ++rank_deficient;
+        else ++inconsistent;
+        if (trials == 1 || verbose)
+          printf("# erasure diagnostic: count=%d, rank(H_E)=%d, checks=%d, reason=%s\n",
+                 nera, erank, rG,
+                 (erank >= 0 && erank < nera) ? "rank deficient" : "inconsistent syndrome");
+      } else
+        for (int j = 0; j < nera; ++j)
+          received[erasures[j]] ^= erasval[j];
+    } else {
+      for (int s = 0; s < rG; ++s)
+        if (sigma[s]) { solved = 0; break; }
+    }
+    if (solved) {
+      /* Verify all outer parity checks after erasure correction. */
+      for (int s = 0; s < rG; ++s)
+        if (dotv(VG + (size_t)s * npts, received, npts)) {
+          solved = 0;
+          break;
+        }
+    }
+    /* A bounded-distance inner decoder can miscorrect to another valid
+       codeword. If the outer syndrome is inconsistent, progressively mark
+       inner blocks corrected at the boundary t as erasures and retry. */
+    if (!solved && nera < rG && ncand) {
+      int base_nera = nera;
+      for (int ci = 0; ci < ncand && nera < rG; ++ci) {
+        int x = near_candidates[ci];
+        erasures[nera++] = x;
+        received[x] = 0;
+        memset(sigma, 0, sizeof(fe) * (size_t)rG);
+        for (int q = 0; q < rG; ++q)
+          sigma[q] = dotv(VG + (size_t)q * npts, received, npts);
+        if (solve_values(VG, rG, sigma, erasures, nera, erasval)) {
+          for (int j = 0; j < nera; ++j)
+            received[erasures[j]] ^= erasval[j];
+          int checks_ok = 1;
+          for (int q = 0; q < rG; ++q)
+            if (dotv(VG + (size_t)q * npts, received, npts)) {
+              checks_ok = 0;
+              break;
+            }
+          if (checks_ok) {
+            solved = 1;
+            ++retry_recoveries;
+            retry_added += nera - base_nera;
+            break;
+          }
+          /* Restore the received word before trying the next candidate. */
+          for (int j = 0; j < nera; ++j)
+            received[erasures[j]] = 0;
+          for (int q = 0; q < npts; ++q) {
+            int is_erased = 0;
+            for (int j = 0; j < nera; ++j)
+              if (erasures[j] == q) { is_erased = 1; break; }
+            if (!is_erased && inner_corr[q] >= 0) {
+              /* Re-decode the saved channel block to restore its symbol. */
+              memcpy(work, bits + (size_t)q * ni, (size_t)ni);
+              if (bc_decode(In, work, NULL, dec) >= 0) {
+                fe sym = 0;
+                for (int b = 0; b < m; ++b)
+                  sym |= (fe)((dec[In->info[b]] & 1) << b);
+                received[q] = sym;
+              }
+            }
+          }
+          solved = 0;
+        }
+      }
+    }
+    int exact = solved && memcmp(received, cw, sizeof(fe) * (size_t)npts) == 0;
+    dec_total += now() - t0;
+    if (exact)
+      successes++;
+    else if (!solved)
+      detected++;
+    else
+      miscorrected++;
+    if (trials == 1 || verbose)
+      printf("# trial %d: %d bit errors (%s, D=%d) -> %d inner erasures / %d symbols -> %s\n",
+             tr + 1, nerr, burst ? "contiguous burst" : "random", interleave, nera, npts,
+             exact ? "EXACT RECOVERY" : (solved ? "WRONG OUTER WORD" : "DETECTED FAILURE"));
+    if (showv && solved)
+      printf("# outer parity checks: all %d rows satisfied\n", rG);
+  }
+  printf("\n");
+  printf("# AG/Goppa concatenation: %s\n",
+         successes == trials ? "[OK]" : "[FAIL]");
+  printf("# Exact recoveries : %d/%d\n", successes, trials);
+  printf("# Detected failures: %d\n", detected);
+  printf("# Wrong outer words: %d\n", miscorrected);
+  printf("# Inner decode failures (erasures): %d total / %d trials\n", inner_decode_failures, trials);
+  printf("# Erasures: average %.2f, maximum %d (outer checks %d)\n", trials ? (double)sum_erasures / trials : 0.0, max_erasures, rG);
+  printf("# Outer solve diagnostics: rank-deficient=%d, inconsistent=%d\n", rank_deficient, inconsistent);
+  printf("# Boundary-erasure retries: recovered=%d, added erasures=%d\n", retry_recoveries, retry_added);
+  printf("# Average encode   : %.6f s\n",
+         enc_total / (trials ? trials : 1));
+  printf("# Average decode   : %.6f s\n",
+         dec_total / (trials ? trials : 1));
+  printf("# RESULT: %s\n", successes == trials ? "PASS" : "FAIL");
+  free(msg); free(cw); free(received); free(sigma); free(erasval);
+  free(erasures); free(near_candidates); free(inner_corr); free(bits); free(txbits); free(work); free(reenc);
+  free(ib); free(dec); free(ep);
+  bc_free(In);
+  return successes == trials ? 0 : 1;
+}
+
 /* ================= command line ================= */
 static void usage(void) {
   puts(
@@ -10006,6 +10853,7 @@ static void usage(void) {
       "  --iters N       product: maximal row/column sweeps  (default 8)\n"
       "  -fht            RM(1,m): ML decoding by the fast Walsh-Hadamard "
       "transform\n"
+      "  -ecp            rs/grs: decode with an independent ECP construction\n"
       "  -shuffle        rs/grs: random order of evaluation points\n"
       "  -random-v       grs: explicit random-multiplier flag (GRS already defaults to it)\n"
       "  -n N            N random trials (summary only)       -v  every trial\n"
@@ -10035,7 +10883,7 @@ int codes_run(int argc, char **argv) {
   int no_errors = 0;
   int m = 0, len = -1, k = -1, t = -1, b = 1, nerr = -1, nera = 0, trials = 1,
       verbose = 0, showv = 0, only_list = 0, iters = 8, ext = 0, shuffle = 0,
-      randv = 0, rmr = 2;
+      randv = 0, rmr = 2, use_ecp = 0;
   unsigned poly = 0, seed = 1;
   for (int i = 1; i < argc; ++i) {
     if (!strcmp(argv[i], "--code") && i + 1 < argc)
@@ -10087,6 +10935,8 @@ int codes_run(int argc, char **argv) {
       shuffle = 1;
     else if (flag(argv[i], "random-v"))
       randv = 1;
+    else if (flag(argv[i], "ecp"))
+      use_ecp = 1;
     else if (flag(argv[i], "v"))
       verbose = 1;
     else if (flag(argv[i], "show-values"))
@@ -10180,12 +11030,13 @@ int codes_run(int argc, char **argv) {
     GRS *G = grs_new(F, n, kk, shuffle, use_randv);
     if (nerr < 0)
       nerr = (n - kk) / 2;
+    if (use_ecp) printf("# decoder: ECP (A=RS(t+1), B=GRS(t) with dual multipliers)\n");
     printf("# code: %s [%d,%d,%d] over GF(2^%d), corrects e errors + s "
            "erasures with 2e+s <= %d\n",
            use_randv ? "GRS" : "RS", n, kk, n - kk + 1, mm, n - kk);
     if (only_list)
       return 0;
-    run_grs(G, trials, nerr, nera, verbose, showv);
+    run_grs(G, trials, nerr, nera, verbose, showv, use_ecp);
     return 0;
   }
   if (!strcmp(code, "rank")) {
