@@ -1,22 +1,15 @@
 /*
- * noize.c -- one-point AG-code FR-VOTE for supported plane curves over
- * GF(2^m)
+ * unified_codes.c -- unified experimental implementation of algebraic-
+ * geometry codes and classical error-correcting codes.
  *
- *   * one-point codes at a rational place at infinity: the basis of L(MP) is
- * built from the NEWTON POLYGON (monomials x^i y^j = lattice points; no local
- * expansions, no linear algebra), certified by Riemann-Roch at run time; if
- * that does not apply (edge of lattice length > 1, ...) it falls back to exact
- * Laurent-series fallback disabled; automatic choice of the
- * best place
- *   * multi-point codes  D = sum m_Q Q  (Galois orbits of places, no field
- * extension needed)
- *   * decoders on the same syndromes:  FR (basic, adaptive locator extraction),
- * BMS (Sakata), VOTE (BMS + Feng-Rao majority voting, t <= (M-2g+1)/2)
- * [one-point], BASIC (kernel of S(h_a f_b), t <= (deg G - 3g + 1)/2)
- * [multi-point]
+ * The AG engine includes one-point and multi-point code experiments with
+ * FR/BMS/VOTE/BASIC decoding paths. The classical engine includes BCH,
+ * Golay, Goppa, alternant, Reed-Muller, Hadamard, GRS, Gabidulin, product,
+ * and concatenated-code experiments.
  *
- * Build: cc -O2 -fopenmp -std=gnu11 -o bbgs_decode bbgs_decode.c    (-fopenmp
- * optional) Run:   ./bbgs_decode --help
+ * Build: cc -O2 -std=gnu11 -fopenmp -Wall -Wextra unified_codes.c -lm -o unified_codes
+ * OpenMP is optional; omit -fopenmp when it is unavailable.
+ * Run:   ./unified_codes --help
  */
 #define _POSIX_C_SOURCE 200809L
 #include <ctype.h>
@@ -10214,7 +10207,7 @@ int codes_run(int argc, char **argv) {
     printf("# product code: C1 = %s (rows)  x  C2 = %s (columns)\n", A->name,
            B2c->name);
     printf("# length %d x %d = %d, dimension %d x %d = %d, d >= %d, "
-           "guaranteed ML radius %d\n",
+           "code-theoretic unique-decoding radius %d\n",
            B2c->n, A->n, A->n * B2c->n, B2c->k, A->k, A->k * B2c->k,
            A->dmin * B2c->dmin, (A->dmin * B2c->dmin - 1) / 2);
     if (only_list)
