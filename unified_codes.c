@@ -10598,6 +10598,13 @@ static int ag_concat_run(const fe *Gen, const fe *VG, int npts, int kcode,
   double enc_total = 0.0, dec_total = 0.0;
   printf("# concatenated code: outer AG[n=%d,k=%d] over GF(2^%d), inner %s\n",
          npts, kcode, m, In->name);
+  printf("# ---- channel error test ----\n");
+  printf("# injected bit errors per trial : %d\n", nerr);
+  printf("# number of trials              : %d\n", trials);
+  printf("# total injected bit errors     : %lld\n",
+         (long long)nerr * (long long)trials);
+  printf("# error pattern                 : %s\n",
+         burst ? "contiguous burst" : "random positions");
   printf("# binary length N=%d, dimension K=%d, inner correction radius t=%d; interleave depth D=%d\n",
          total, kcode * m, In->t, interleave);
   printf("# outer erasure capacity is determined by rank of the erased columns of H\n");
