@@ -8387,7 +8387,10 @@ int noize_decode(int argc, char **argv, const uint16_t *received,
  *   goppa    binary classical Goppa code Gamma(L,g), g irreducible, corrects
  *            t = deg g errors: extended Euclid on the key equation modulo g^2
  *            (Patterson-equivalent, no square roots needed)
- *   alt      random binary alternant code (alpha_i, y_i random), t = r/2
+ *   alt      random binary alternant code (alpha_i, y_i random), t = floor(r/2)
+ *   srivastava  original Srivastava alternant (multiplicity 1, z_i=alpha_i^mu)
+ *   gs       generalized Srivastava alternant, with s poles and multiplicity t
+ *            (designed distance >= s*t+1); BM by default, generic EEA via -eea
  *   rm       binary Reed-Muller code RM(r,m) = [2^m, sum_{i<=r} C(m,i),
  *            2^(m-r)], Reed majority-logic decoding (corrects 2^(m-r-1)-1)
  *   hadamard Hadamard code [2^m, m, 2^(m-1)]; with -fht also RM(1,m): maximum-
@@ -8990,6 +8993,91 @@ static int altc_decode_bm(const AltCode *A, const uint8_t *rcv,
   }
   return c;
 }
+/* Generic binary alternant decoder using the extended Euclidean algorithm.
+ * For S(x)=sum_j s_j x^j, solve Lambda*S = Omega (mod x^r), with
+ * deg(Lambda)<=floor(r/2), then Chien-search Lambda and apply Forney.
+ * This is the EEA counterpart of alt_decode()'s Berlekamp-Massey path.
+ * Erasures are deliberately rejected here; the BM path supports them. */
+static int altc_decode_eea(const AltCode *A, const uint8_t *rcv,
+                           uint8_t *out) {
+  const GF *F = A->F;
+  const int n = A->n, r = A->r, t = r / 2;
+  if (r < 1 || r > ET_PMAXD / 2)
+    return -1;
+  memcpy(out, rcv, (size_t)n);
+  Poly S, mod, r0, r1, t0, t1, q, rem, qt, t2, Lam, Om, dLam;
+  S.deg = r - 1;
+  memset(S.c, 0, sizeof(fe) * (size_t)r);
+  for (int i = 0; i < n; ++i) {
+    if (!rcv[i]) continue;
+    fe v = gmul(F, A->y[i], rcv[i]);
+    for (int j = 0; j < r; ++j) {
+      S.c[j] ^= v;
+      v = gmul(F, v, A->al[i]);
+    }
+  }
+  ptrim(&S);
+  if (S.deg < 0) return 0;
+
+  /* EEA: r0=x^r, r1=S; t0=0, t1=1. */
+  mod.deg = r;
+  memset(mod.c, 0, sizeof(fe) * (size_t)(r + 1));
+  mod.c[r] = 1;
+  pcopy(&r0, &mod);
+  pcopy(&r1, &S);
+  t0.deg = -1;
+  t1.deg = 0;
+  t1.c[0] = 1;
+  while (r1.deg >= (r + 1) / 2) {
+    if (r1.deg < 0) return -1;
+    pdivmod(F, &r0, &r1, &q, &rem);
+    pmul(F, &q, &t1, &qt);
+    padd(&t0, &qt, &t2);
+    pcopy(&r0, &r1);
+    pcopy(&r1, &rem);
+    pcopy(&t0, &t1);
+    pcopy(&t1, &t2);
+    if (t1.deg > t) return -1;
+  }
+  if (t1.deg < 1 || t1.deg > t || !t1.c[0]) return -1;
+  fe scale = ginv(F, t1.c[0]);
+  for (int j = 0; j <= t1.deg; ++j)
+    t1.c[j] = gmul(F, t1.c[j], scale);
+  pcopy(&Lam, &t1);
+
+  /* Omega = Lambda*S mod x^r. */
+  pmul(F, &Lam, &S, &Om);
+  if (Om.deg >= r) Om.deg = r - 1;
+  ptrim(&Om);
+  pderiv(&Lam, &dLam);
+
+  int cnt = 0, roots = 0;
+  for (int i = 0; i < n; ++i) {
+    if (!A->al[i]) return -1;
+    fe x = ginv(F, A->al[i]);
+    if (peval(F, &Lam, x)) continue;
+    ++roots;
+    fe den = peval(F, &dLam, x);
+    if (!den) return -1;
+    fe num = gmul(F, A->al[i], peval(F, &Om, x));
+    fe e = gdiv(F, gdiv(F, num, den), A->y[i]);
+    if (e != 1) return -1; /* this module is a binary code */
+    A->pos[cnt] = i;
+    A->val[cnt] = e;
+    out[i] ^= 1;
+    ++cnt;
+  }
+  if (roots != Lam.deg || cnt != Lam.deg) return -1;
+
+  /* Independent post-correction syndrome check. */
+  for (int j = 0; j < r; ++j) {
+    fe sum = 0;
+    for (int i = 0; i < n; ++i)
+      if (out[i]) sum ^= gmul(F, A->y[i], gpow(F, A->al[i], j));
+    if (sum) return -1;
+  }
+  return cnt;
+}
 /* S(z) = sum_{w_i=1} (z - alpha_i)^(-1) mod g^2 */
 static void goppa_syndrome(const AltCode *A, const uint8_t *w, Poly *S) {
   const GF *F = A->F;
@@ -9152,6 +9240,62 @@ static AltCode *make_goppa(int m, unsigned poly, int t, int n) {
   return A;
 }
 
+/* Generalized Srivastava / Srivastava binary alternant construction.
+ * GS parity checks are z_i/(alpha_i-w_j)^ell, j=1..s, ell=1..mult.
+ * In standard alternant form they have r=s*mult rows with
+ * y_i=z_i/prod_j(alpha_i-w_j)^mult and a suitable polynomial basis.
+ * The original Srivastava family is mult=1, z_i=alpha_i^mu. */
+static AltCode *make_srivastava(int m, unsigned poly, int s, int mult,
+                                int n, int mu, int original) {
+  GF *F = gf_new(m, poly);
+  if (s < 1 || mult < 1 || mult > ET_PMAXD / 2 ||
+      s > (ET_PMAXD / 2) / mult)
+    die("Srivastava requires s>=1, multiplicity>=1, and s*multiplicity<=%d",
+        ET_PMAXD / 2);
+  if (original && mult != 1)
+    die("the original Srivastava construction uses multiplicity 1");
+  if (s >= F->ord)
+    die("need fewer poles than nonzero field elements (s < 2^m-1)");
+
+  /* Choose distinct nonzero poles, then support points disjoint from them.
+   * Nonzero alpha values are required by the current Forney/Chien decoder. */
+  fe *pool = malloc(sizeof(fe) * (size_t)F->ord);
+  if (!pool) die("out of memory creating Srivastava support");
+  for (int i = 0; i < F->ord; ++i) pool[i] = F->exp[i];
+  for (int i = F->ord - 1; i > 0; --i) {
+    int j = (int)(rnd() % (uint64_t)(i + 1));
+    fe z = pool[i]; pool[i] = pool[j]; pool[j] = z;
+  }
+  fe *w = malloc(sizeof(fe) * (size_t)s);
+  if (!w) die("out of memory creating Srivastava poles");
+  memcpy(w, pool, sizeof(fe) * (size_t)s);
+  int maxn = F->ord - s;
+  if (n <= 0) n = maxn;
+  if (n < 2 || n > maxn)
+    die("Srivastava length n must be in 2..%d (nonzero support excluding s poles)", maxn);
+  int r = s * mult;
+  if (r >= n)
+    die("Srivastava requires s*multiplicity < n (got %d >= %d)", r, n);
+
+  AltCode *A = altc_alloc(F, n, r);
+  for (int i = 0; i < n; ++i) {
+    fe alpha = pool[s + i];
+    A->al[i] = alpha;
+    fe denom = 1;
+    for (int j = 0; j < s; ++j) {
+      fe d = (fe)(alpha ^ w[j]);
+      for (int ell = 0; ell < mult; ++ell)
+        denom = gmul(F, denom, d);
+    }
+    fe z = original ? gpow(F, alpha, mu) : grand_nz(F);
+    A->y[i] = gdiv(F, z, denom);
+  }
+  free(pool);
+  free(w);
+  altc_build(A);
+  return A;
+}
+
 /* ================= Golay codes ================= */
 #define GOLAY_G 0xC75u /* x^11+x^10+x^6+x^5+x^4+x^2+1 divides x^23 + 1 */
 static uint32_t gol_rem(uint32_t v) {
@@ -9184,6 +9328,7 @@ static uint32_t *golay_table(void) {
 /* ================= unified binary code object ================= */
 static int g_fht =
     0; /* -fht: RM(1,m) is decoded by the Walsh-Hadamard transform */
+static int g_alt_eea = 0; /* -eea: generic alternant EEA instead of BM */
 typedef enum {
   BC_ALT = 0,
   BC_GOPPA = 1,
@@ -9475,10 +9620,14 @@ static int bc_decode(const BinCode *B, const uint8_t *rcv, const uint8_t *era,
                                    : rm_decode(B, rcv, out);
   if (B->kind == BC_GOPPA)
     return altc_decode_goppa(B->alt, rcv, out);
+  if (g_alt_eea) {
+    if (era) return -1;
+    return altc_decode_eea(B->alt, rcv, out);
+  }
   return altc_decode_bm(B->alt, rcv, era, out);
 }
 
-/* parse "bch:m:t[:n[:b]]", "golay", "golay24", "goppa:m:t[:n]", "alt:m:n:t" */
+/* parse BCH/Goppa/Alternant and Srivastava-family specifications */
 static BinCode *bc_parse(const char *spec, unsigned poly) {
   char buf[128], *tok[8];
   int nt = 0;
@@ -9518,8 +9667,28 @@ static BinCode *bc_parse(const char *spec, unsigned poly) {
              2 * v[3] + 1, v[1]);
     return bc_from_alt(A, name, v[3]);
   }
+  if (!strcmp(tok[0], "srivastava") && nt >= 3) {
+    int mm=v[1], ss=v[2], nn=nt>3?v[3]:0, mu=nt>4?v[4]:0;
+    AltCode *A=make_srivastava(mm,poly,ss,1,nn,mu,1);
+    int r=ss, terr=r/2;
+    snprintf(name,sizeof name,"Srivastava[%d,%d,>=%d] GF(2^%d) s=%d mu=%d",
+             A->n,A->k,r+1,mm,ss,mu);
+    BinCode *B=bc_from_alt(A,name,terr);
+    B->dmin=r+1;
+    return B;
+  }
+  if (!strcmp(tok[0], "gs") && nt >= 4) {
+    int mm=v[1], ss=v[2], mult=v[3], nn=nt>4?v[4]:0;
+    AltCode *A=make_srivastava(mm,poly,ss,mult,nn,0,0);
+    int r=ss*mult, terr=r/2;
+    snprintf(name,sizeof name,"GS[%d,%d,>=%d] GF(2^%d) s=%d t=%d",
+             A->n,A->k,r+1,mm,ss,mult);
+    BinCode *B=bc_from_alt(A,name,terr);
+    B->dmin=r+1;
+    return B;
+  }
   die("bad code spec '%s' (bch:m:t[:n[:b]] | golay | golay24 | goppa:m:t[:n] | "
-      "alt:m:n:t | rm:r:m | had:m)",
+      "alt:m:n:t | srivastava:m:s[:n[:mu]] | gs:m:s:t[:n] | rm:r:m | had:m)",
       spec);
   return NULL;
 }
@@ -10033,6 +10202,8 @@ static void run_bincode(const BinCode *B, int trials, int nerr, int nera,
   int n = B->n, k = B->k;
   if (nera && B->kind != BC_ALT)
     die("--erasures is supported for bch / alt codes (and grs, concat)");
+  if (nera && g_alt_eea)
+    die("-eea currently supports errors only; use the default BM decoder for erasures");
   if (nerr + nera > n)
     die("too many errors/erasures for n=%d", n);
   uint8_t *msg = malloc((size_t)k), *cw = malloc((size_t)n),
@@ -11254,23 +11425,25 @@ static int ag_concat_run(const fe *Gen, const fe *VG, int npts, int kcode,
 static void usage(void) {
   puts(
       "codes [options] [seed]\n"
-      "  --code bch|golay|goppa|alt|rm|hadamard|rs|grs|rank|product|concat   "
+      "  --code bch|golay|goppa|alt|srivastava|gs|rm|hadamard|rs|grs|rank|product|concat   "
       "(default bch)\n"
       "  --m m           field GF(2^m), m <= 12              (default per "
       "code)\n"
       "  --poly 0x43     primitive polynomial of GF(2^m)     (default: "
       "standard)\n"
       "  --len n         code length (bch: also divisors of 2^m-1 => cyclic; "
-      "goppa/alt/rs/grs/rank)\n"
+      "goppa/alt/srivastava/gs/rs/grs/rank)\n"
       "  --k k           dimension (rs, grs, rank, concat outer code)\n"
-      "  --t t           correction capability (bch, goppa = deg g, alt)\n"
+      "  --t t           correction capability (bch, goppa = deg g, alt; gs multiplicity)\n"
+      "  --s s           Srivastava/GS number of poles (default per code)\n"
+      "  --mu mu         original Srivastava multiplier exponent (default 0)\n"
       "  --r r           Reed-Muller order: RM(r,m), length 2^m     (default "
       "2)\n"
       "  --b b           first zero beta^b of the BCH code   (default 1)\n"
       "  --ext           golay: extended [24,12,8] code\n"
       "  --errors e      injected errors (bits / symbols / rank / total bits)\n"
       "                  default: the guaranteed capability of the code\n"
-      "  --erasures s    injected erasures (bch, alt, rs, grs)\n"
+      "  --erasures s    injected erasures (bch, alternant/Srivastava, rs, grs)\n"
       "  --input FILE    encode/decode data from a file (binary-code "
       "families)\n"
       "  --input-format binary|text   input format (default binary)\n"
@@ -11282,7 +11455,9 @@ static void usage(void) {
       "  --inner spec    concat: inner binary code             (default "
       "golay)\n"
       "        specs:  bch:m:t[:n[:b]]  golay  golay24  goppa:m:t[:n]  "
-      "alt:m:n:t  rm:r:m  had:m\n"
+      "alt:m:n:t  srivastava:m:s[:n[:mu]]  gs:m:s:t[:n]  rm:r:m  had:m\n"
+      "  -eea            alternant/Srivastava: extended-Euclid decoder (no erasures)\n"
+      "  (default alternant/Srivastava decoder: Berlekamp-Massey)\n"
       "  --iters N       product: maximal row/column sweeps  (default 8)\n"
       "  -fht            RM(1,m): ML decoding by the fast Walsh-Hadamard "
       "transform\n"
@@ -11297,6 +11472,8 @@ static void usage(void) {
       "  codes --code rm --r 2 --m 6 --errors 7 -n 200\n"
       "  codes --code golay --ext --errors 3 -n 1000\n"
       "  codes --code goppa --m 8 --t 10 --errors 10 -n 20\n"
+      "  codes --code srivastava --m 6 --s 9 --errors 4 -eea\n"
+      "  codes --code gs --m 8 --s 4 --t 3 --errors 6 -n 100\n"
       "  codes --code rs  --m 8 --len 255 --k 223 --errors 10 --erasures 12\n"
       "  codes --code grs --m 8 --len 255 --k 223 --errors 10 --erasures 12\n"
       "  codes --code rank --m 8 --len 8 --k 4 --errors 2\n"
@@ -11314,9 +11491,10 @@ int codes_run(int argc, char **argv) {
   const char *input_path = NULL, *output_path = NULL;
   const char *input_format = "binary", *output_format = "screen";
   int no_errors = 0;
-  int m = 0, len = -1, k = -1, t = -1, b = 1, nerr = -1, nera = 0, trials = 1,
-      verbose = 0, showv = 0, only_list = 0, iters = 8, ext = 0, shuffle = 0,
-      randv = 0, rmr = 2, use_ecp = 0;
+  int m = 0, len = -1, k = -1, t = -1, sparam = -1, mu = 0, b = 1,
+      nerr = -1, nera = 0, trials = 1, verbose = 0, showv = 0,
+      only_list = 0, iters = 8, ext = 0, shuffle = 0, randv = 0,
+      rmr = 2, use_ecp = 0;
   unsigned poly = 0, seed = 1;
   for (int i = 1; i < argc; ++i) {
     if (!strcmp(argv[i], "--code") && i + 1 < argc)
@@ -11331,6 +11509,10 @@ int codes_run(int argc, char **argv) {
       k = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--t") && i + 1 < argc)
       t = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--s") && i + 1 < argc)
+      sparam = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--mu") && i + 1 < argc)
+      mu = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--r") && i + 1 < argc)
       rmr = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--b") && i + 1 < argc)
@@ -11370,6 +11552,10 @@ int codes_run(int argc, char **argv) {
       randv = 1;
     else if (flag(argv[i], "ecp"))
       use_ecp = 1;
+    else if (flag(argv[i], "eea"))
+      g_alt_eea = 1;
+    else if (flag(argv[i], "bm"))
+      g_alt_eea = 0;
     else if (flag(argv[i], "v"))
       verbose = 1;
     else if (flag(argv[i], "show-values"))
@@ -11392,6 +11578,7 @@ int codes_run(int argc, char **argv) {
     (void)rnd();
 
   if (!strcmp(code, "bch") || !strcmp(code, "alt") || !strcmp(code, "goppa") ||
+      !strcmp(code, "srivastava") || !strcmp(code, "gs") ||
       !strcmp(code, "golay") || !strcmp(code, "rm") ||
       !strcmp(code, "hadamard")) {
     BinCode *B;
@@ -11402,7 +11589,26 @@ int codes_run(int argc, char **argv) {
       B = bc_had(m ? m : 6);
     else if (!strcmp(code, "rm"))
       B = bc_rm(rmr, m ? m : 5);
-    else {
+    else if (!strcmp(code, "srivastava") || !strcmp(code, "gs")) {
+      int mm = m ? m : (!strcmp(code, "srivastava") ? 6 : 8);
+      int ss = sparam > 0 ? sparam : (!strcmp(code, "srivastava") ? 8 : 3);
+      if (!strcmp(code, "srivastava")) {
+        AltCode *A=make_srivastava(mm,poly,ss,1,len>0?len:0,mu,1);
+        int rr=ss;
+        char nm[128];
+        snprintf(nm,sizeof nm,"Srivastava[%d,%d,>=%d] GF(2^%d) s=%d mu=%d",
+                 A->n,A->k,rr+1,mm,ss,mu);
+        B=bc_from_alt(A,nm,rr/2); B->dmin=rr+1;
+      } else {
+        int mult=t>0?t:2;
+        AltCode *A=make_srivastava(mm,poly,ss,mult,len>0?len:0,0,0);
+        int rr=ss*mult;
+        char nm[128];
+        snprintf(nm,sizeof nm,"GS[%d,%d,>=%d] GF(2^%d) s=%d t=%d",
+                 A->n,A->k,rr+1,mm,ss,mult);
+        B=bc_from_alt(A,nm,rr/2); B->dmin=rr+1;
+      }
+    } else {
       int mm = m ? m : (!strcmp(code, "goppa") ? 8 : 6);
       int tt = t > 0 ? t : (!strcmp(code, "goppa") ? 10 : 3);
       if (!strcmp(code, "bch"))
@@ -11421,10 +11627,10 @@ int codes_run(int argc, char **argv) {
     if (input_path)
       fprintf(stderr, "# code: %s, dimension k=%d, corrects t=%d errors%s\n",
               B->name, B->k, B->t,
-              B->kind == BC_ALT ? " (+ erasures: 2e+s <= 2t)" : "");
+              B->kind == BC_ALT ? " (+ erasures: 2e+s <= r)" : "");
     else
       printf("# code: %s, dimension k=%d, corrects t=%d errors%s\n", B->name,
-             B->k, B->t, B->kind == BC_ALT ? " (+ erasures: 2e+s <= 2t)" : "");
+             B->k, B->t, B->kind == BC_ALT ? " (+ erasures: 2e+s <= r)" : "");
     if (only_list)
       return 0;
     if (input_path) {
@@ -11450,7 +11656,7 @@ int codes_run(int argc, char **argv) {
   if (input_path || output_path || strcmp(input_format, "binary") ||
       strcmp(output_format, "screen"))
     die("file mode is currently implemented for "
-        "bch/golay/goppa/alt/rm/hadamard");
+        "bch/golay/goppa/alt/srivastava/gs/rm/hadamard");
   if (!strcmp(code, "rs") || !strcmp(code, "grs")) {
     int mm = m ? m : 8;
     if (!strcmp(code, "rs") && randv)
@@ -11545,7 +11751,7 @@ static void unified_usage(void) {
   puts("\nFAMILIES");
   puts("  ag          Algebraic-geometry codes (default; "
        "BBGS/Hermitian/Suzuki/custom)");
-  puts("  classical   BCH, Golay, Goppa, alternant, Reed-Muller, Hadamard,");
+  puts("  classical   BCH, Golay, Goppa, alternant, Srivastava/GS, Reed-Muller, Hadamard,");
   puts("              RS/GRS, Gabidulin(rank), product, and concatenated codes");
   puts("\nHELP");
   puts("  --help                    Show this overview");
