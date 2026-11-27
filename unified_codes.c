@@ -5647,6 +5647,74 @@ static int limit_Mmax(int g, int n) {
     mm = MAXB - 2; /* basis array holds M+1 functions */
   return mm;
 }
+static int suggest_param_mode = 0;
+
+/* Print a compact parameter frontier for the current one-point AG curve.
+ * The bounds below are the same designed bounds used by print_limits(). */
+static void print_suggest_params(int g, int n, int requested_t) {
+  int Mmin = 2 * g;
+  int Mmax = limit_Mmax(g, n);
+  int cap = MAXT - 2;
+  puts("# ---- suggested one-point AG parameters ----");
+  printf("# exact curve data: genus g=%d, affine positions n=%d\n", g, n);
+  printf("# build limits: M<=%d, errors<=%d\n", MAXB - 2, cap);
+  if (Mmax < Mmin) {
+    printf("# no feasible M: need M >= %d but injectivity/build limit gives M <= %d\n",
+           Mmin, Mmax);
+    puts("# condition: n > 3g+1 and M+g < n");
+    return;
+  }
+  puts("# table is sorted by descending M (higher rate / larger syndrome bound first)");
+  puts("#       M       k_RR      rate       t_FR/BMS    t_vote");
+  int span = Mmax - Mmin;
+  int step = (span + 98) / 99;
+  if (step < 1) step = 1;
+  int last = -1;
+  for (int M = Mmax; M >= Mmin; --M) {
+    if (M != Mmax && M != Mmin && ((Mmax - M) % step) != 0)
+      continue;
+    int k = M - g + 1;
+    int tb = (M - 3 * g + 1) / 2;
+    int tv = (M - 2 * g + 1) / 2;
+    if (tb < 0) tb = 0;
+    if (tv < 0) tv = 0;
+    if (tb > cap) tb = cap;
+    if (tv > cap) tv = cap;
+    printf("# %7d %9d %10.6f %11d %10d\n", M, k,
+           n > 0 ? (double)k / (double)n : 0.0, tb, tv);
+    last = M;
+  }
+  if (last != Mmin) {
+    int k = Mmin - g + 1;
+    int tb = (Mmin - 3 * g + 1) / 2;
+    int tv = (Mmin - 2 * g + 1) / 2;
+    if (tb < 0) tb = 0;
+    if (tv < 0) tv = 0;
+    if (tb > cap) tb = cap;
+    if (tv > cap) tv = cap;
+    printf("# %7d %9d %10.6f %11d %10d\n", Mmin, k,
+           n > 0 ? (double)k / (double)n : 0.0, tb, tv);
+  }
+  if (requested_t >= 0) {
+    long long Mfr = 2LL * requested_t + 3LL * g - 1;
+    long long Mvote = 2LL * requested_t + 2LL * g;
+    printf("# for requested errors t=%d:\n", requested_t);
+    printf("#   FR/BMS needs M >= %lld; ", Mfr);
+    if (Mfr <= Mmax && Mfr <= MAXB - 2)
+      printf("feasible, k=%lld, rate=%.6f\n", Mfr - g + 1,
+             (double)(Mfr - g + 1) / (double)n);
+    else
+      puts("not feasible under current n/build limits");
+    printf("#   voting needs M >= %lld; ", Mvote);
+    if (Mvote <= Mmax && Mvote <= MAXB - 2)
+      printf("feasible, k=%lld, rate=%.6f\n", Mvote - g + 1,
+             (double)(Mvote - g + 1) / (double)n);
+    else
+      puts("not feasible under current n/build limits");
+  }
+  puts("# k_RR=M-g+1 is the Riemann-Roch dimension; actual decoding still depends on a certified basis.");
+}
+
 static void print_limits(int g, int n, int t) {
   int Mmax = limit_Mmax(g, n), cap = MAXT - 2;
   puts("# ---- parameter limits (this build, this curve) ----");
@@ -5723,6 +5791,7 @@ static void usage(void) {
       "(default: run them anyway)\n"
       "  -limits          print the parameter limits of this build/curve and "
       "exit\n"
+      "  --suggest-param  print a descending-M parameter/rate frontier and exit\n"
       "  -basic           (multi-point) Niederreiter syndrome decoding test\n"
       "                    (default: error vector -> syndrome -> decode)\n"
       "  -encode          additionally generate a random AG codeword, add "
@@ -6357,6 +6426,11 @@ static int suzuki_run(int q_req, int nerr, int Mreq, int trials, int verbose,
   printf(
       "# %d affine rational points (+1 at infinity); semigroup <%d,%d,%d,%d>\n",
       sz_np, q, q + sz_q0, q + 2 * sz_q0, q + 2 * sz_q0 + 1);
+  if (suggest_param_mode) {
+    print_suggest_params(sz_g, sz_np, nerr);
+    sz_free_all();
+    return 0;
+  }
   printf("# one-point code: M = %d, g = %d, designed t <= %d, locators in "
          "L(%d P_inf)\n",
          sz_M, sz_g, sz_tau, sz_ldeg);
@@ -6574,11 +6648,12 @@ static int cv_trial(const Curve *c) {
   cv_store(&save);
   return ok;
 }
-static struct {
+typedef struct {
   int kind; /* 0 swap, 1 Y->Y+cX^k, 2 X->X+cY^k */
   fe c;
   int k;
-} cvs[10];
+} CVStep;
+static CVStep cvs[10];
 static int cvn, cv_budget;
 static int cv_search(const Curve *cur, int depth, int need_place, Curve *res) {
   int monic = cv_xmonic(cur);
@@ -6592,7 +6667,7 @@ static int cv_search(const Curve *cur, int depth, int need_place, Curve *res) {
   if (!monic) {
     cv_swap(cur, &nx);
     if (cv_xmonic(&nx)) {
-      cvs[cvn++] = (typeof(cvs[0])){0, 0, 0};
+      cvs[cvn++] = (CVStep){0, 0, 0};
       if (cv_search(&nx, depth - 1, need_place, res))
         return 1;
       cvn--;
@@ -6601,7 +6676,7 @@ static int cv_search(const Curve *cur, int depth, int need_place, Curve *res) {
     for (int a = 1; a < FS && tried < 2; ++a)
       if (cv_subst(cur, &nx, 1, (fe)a, 1) && cv_xmonic(&nx)) {
         ++tried;
-        cvs[cvn++] = (typeof(cvs[0])){1, (fe)a, 1};
+        cvs[cvn++] = (CVStep){1, (fe)a, 1};
         if (cv_search(&nx, depth - 1, need_place, res))
           return 1;
         cvn--;
@@ -6615,10 +6690,11 @@ static int cv_search(const Curve *cur, int depth, int need_place, Curve *res) {
   g_trial = 1;
   g_trial_fail = 0;
   int g = build_edges();
-  struct {
+  typedef struct {
     int onY, k;
     fe c;
-  } cand[64];
+  } CVCandidate;
+  CVCandidate cand[64];
   int nc = 0;
   if (!g_trial_fail) {
     genus_g = g;
@@ -6635,13 +6711,13 @@ static int cv_search(const Curve *cur, int depth, int need_place, Curve *res) {
         fe u0 = inv(facs[f].c[0]); /* x^ex y^ey = u0 at this place */
         int ex = ed[k].ex, ey = ed[k].ey;
         if (ey == 1 && ex <= 0)
-          cand[nc++] = (typeof(cand[0])){1, -ex, u0};
+          cand[nc++] = (CVCandidate){1, -ex, u0};
         else if (ey == -1 && ex >= 0)
-          cand[nc++] = (typeof(cand[0])){1, ex, inv(u0)};
+          cand[nc++] = (CVCandidate){1, ex, inv(u0)};
         else if (ex == 1 && ey <= 0)
-          cand[nc++] = (typeof(cand[0])){0, -ey, u0};
+          cand[nc++] = (CVCandidate){0, -ey, u0};
         else if (ex == -1 && ey >= 0)
-          cand[nc++] = (typeof(cand[0])){0, ey, inv(u0)};
+          cand[nc++] = (CVCandidate){0, ey, inv(u0)};
       }
       free(facs);
     }
@@ -6650,7 +6726,7 @@ static int cv_search(const Curve *cur, int depth, int need_place, Curve *res) {
   cv_store(&save);
   for (int z = 0; z < nc; ++z)
     if (cv_subst(cur, &nx, cand[z].onY, cand[z].c, cand[z].k)) {
-      cvs[cvn++] = (typeof(cvs[0])){cand[z].onY ? 1 : 2, cand[z].c, cand[z].k};
+      cvs[cvn++] = (CVStep){cand[z].onY ? 1 : 2, cand[z].c, cand[z].k};
       if (cv_search(&nx, depth - 1, need_place, res))
         return 1;
       cvn--;
@@ -6908,6 +6984,8 @@ int noize_run(int argc, char **argv) {
       bbgs_b = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--errors") && i + 1 < argc)
       nerr = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--suggest-param"))
+      suggest_param_mode = 1;
     else if (!strcmp(argv[i], "--fixed-error-value") && i + 1 < argc)
       fixed_value_req = (int)strtol(argv[++i], NULL, 0);
     else if (!strcmp(argv[i], "-common-binary"))
@@ -7264,6 +7342,10 @@ int noize_run(int argc, char **argv) {
              FM, qfam);
   }
   print_limits(GENUS, npts, concat_inner ? 0 : nerr);
+  if (suggest_param_mode) {
+    print_suggest_params(GENUS, npts, nerr);
+    return 0;
+  }
   if (only_list)
     return 0;
   /*
