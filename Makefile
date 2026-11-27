@@ -16,6 +16,14 @@ all: $(TARGET)
 $(TARGET): $(SRC)
 	$(CC) $(CFLAGS) $(OPENMP) $(LDFLAGS) $< -o $@ $(LDLIBS)
 
+match: 
+	gcc -O3 -march=native -mtune=native -std=c11 \
+  		-Wall -Wextra -o unified_codes unified_codes_matched_errors.c -lm
+
+suggest:
+	gcc -O3 -march=native -mtune=native -std=gnu11 \
+	  	-Wall -Wextra -o unified_codes unified_codes_suggest_param.c -lm
+
 # Reproducible short regression test: 100 trials, 1000 injected bit errors.
 check: $(TARGET)
 	OMP_NUM_THREADS=1 ./$(TARGET) \

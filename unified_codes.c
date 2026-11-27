@@ -6857,6 +6857,10 @@ static int ag_concat_run(const fe *Gen, const fe *VG, int npts, int kcode,
                          int rG, int outer_m, const char *inner_spec,
                          unsigned poly, int trials, int nerr, int verbose,
                          int showv, int burst, int interleave);
+static int ag_concat_frvote_run(int npts, int kcode, int outer_m,
+                                const char *inner_spec, unsigned poly,
+                                int trials, int nerr, int verbose,
+                                int showv, int burst, int interleave);
 
 int noize_run(int argc, char **argv) {
   const char *terms = "16,0;0,1;15,4;12,16", *polespec = NULL,
@@ -6987,6 +6991,13 @@ int noize_run(int argc, char **argv) {
       return 1;
     } else
       seed = (unsigned)strtoul(argv[i], NULL, 10);
+  }
+  /* The one-point AG/Goppa concatenation is decoded as one outer AG
+   * syndrome problem after the binary inner decoders.  Select FR-VOTE
+   * automatically; the legacy multi-point concatenation path remains separate. */
+  if (concat_inner && !polespec) {
+    run_fr = run_bms = run_vote = 0;
+    run_frvote = 1;
   }
   if (run_frvote && run_fr) {
     fprintf(stderr, "-frvote cannot be combined with -fr: FR-VOTE keeps no "
@@ -7275,9 +7286,10 @@ int noize_run(int argc, char **argv) {
   if (run_common_binary) {
     run_fr = run_bms = run_vote = run_frvote = 0;
   }
-  if (nerr < 1 || (!concat_inner && nerr > MAXT - 2)) {
+  if ((concat_inner ? nerr < 0 : nerr < 1) ||
+      (!concat_inner && nerr > MAXT - 2)) {
     if (concat_inner)
-      fprintf(stderr, "--errors must be positive for concatenation\n");
+      fprintf(stderr, "--errors must be nonnegative for concatenation\n");
     else
       fprintf(stderr, "--errors out of range (1..%d)\n", MAXT - 2);
     return 1;
@@ -7943,7 +7955,7 @@ int noize_run(int argc, char **argv) {
       }
     }
     nbasis = B->n;
-    if (run_frvote && !concat_inner) {
+    if (run_frvote) {
       /* FR-VOTE's Newton syndrome path only needs monomial exponents and
        * point coordinates.  Do not allocate nbasis*npts field elements;
        * selected error positions are evaluated on demand. */
@@ -7995,10 +8007,9 @@ int noize_run(int argc, char **argv) {
     }
   }
   if (concat_inner) {
-    /* Build the one-point outer AG code directly from the Newton monomials
-     * with pole order <= M.  Its parity-check matrix is the nullspace of the
-     * evaluation generator matrix.  This is deliberately separate from the
-     * multi-point divisor path; no silent algorithm switch is performed. */
+    /* One-point AG/Goppa concatenation: use the Newton basis functions as
+     * outer parity checks and let FR-VOTE decode their direct syndromes.
+     * No outer generator matrix or nullspace is constructed in this path. */
     int kcode = 0;
     for (int i = 0; i < nbasis; ++i)
       if (basis[i].rho <= M)
@@ -8013,64 +8024,12 @@ int noize_run(int argc, char **argv) {
               kcode, expected_k, M, GENUS);
       return 2;
     }
-    fe *Gen = calloc((size_t)kcode * npts, sizeof(fe));
-    if (!Gen) {
-      fprintf(stderr, "ERROR: out of memory constructing one-point AG generator\n");
-      return 2;
-    }
-    int gr = 0;
-    for (int i = 0; i < nbasis; ++i) {
-      if (basis[i].rho > M)
-        continue;
-      if (!basis[i].val) {
-        fprintf(stderr, "ERROR: Newton evaluation row %d was not materialized\n", i);
-        free(Gen);
-        return 2;
-      }
-      memcpy(Gen + (size_t)gr * npts, basis[i].val,
-             sizeof(fe) * (size_t)npts);
-      gr++;
-    }
-    fe *Gwork = malloc(sizeof(fe) * (size_t)kcode * npts);
-    fe *VG = NULL;
-    if (!Gwork) {
-      free(Gen);
-      fprintf(stderr, "ERROR: out of memory constructing one-point parity checks\n");
-      return 2;
-    }
-    memcpy(Gwork, Gen, sizeof(fe) * (size_t)kcode * npts);
-    int rG = nullspace_gf(Gwork, kcode, npts, &VG);
-    free(Gwork);
-    if (rG != npts - kcode || !VG) {
-      fprintf(stderr,
-              "ERROR: one-point AG evaluation matrix rank failure: "
-              "nullity=%d, expected %d.\n"
-              "       The selected evaluation points may not be injective "
-              "or the Newton basis may be incomplete.\n",
-              rG, npts - kcode);
-      free(Gen);
-      free(VG);
-      return 2;
-    }
-    for (int h = 0; h < rG; ++h)
-      for (int j = 0; j < kcode; ++j)
-        if (dotv(VG + (size_t)h * npts,
-                 Gen + (size_t)j * npts, npts)) {
-          fprintf(stderr,
-                  "ERROR: one-point AG parity-check validation failed "
-                  "at row %d, generator %d\n", h, j);
-          free(Gen);
-          free(VG);
-          return 2;
-        }
-    printf("# one-point AG outer code: [n=%d,k=%d,r=%d] over GF(2^%d), "
-           "Newton basis; designed distance >= %d\n",
-           npts, kcode, rG, m_bits, npts - M);
-    int rc = ag_concat_run(Gen, VG, npts, kcode, rG, m_bits,
-                           concat_inner, poly, trials, nerr, verbose,
-                           show_values, concat_burst, concat_interleave);
-    free(Gen);
-    free(VG);
+    printf("# one-point AG outer code: [n=%d,k=%d] over GF(2^%d), "
+           "Newton check functions; designed distance >= %d\n",
+           npts, npts - kcode, m_bits, M - 2 * GENUS + 2);
+    int rc = ag_concat_frvote_run(npts, kcode, m_bits, concat_inner, poly,
+                                  trials, nerr, verbose, show_values,
+                                  concat_burst, concat_interleave);
     for (int i = 0; i < nbasis; ++i)
       free(basis[i].val);
     if (via_newton[best]) {
@@ -10534,6 +10493,391 @@ static int ag_erasure_rank(const fe *VG, int rG, const int *Z, int nz) {
  * decodes become symbol erasures.  The AG parity-check matrix then solves
  * H_E * e_E = H * y, uniquely when the erased columns have full rank.
  */
+/* One-point Niederreiter-style concatenation:
+ *  - inner blocks are binary Goppa words;
+ *  - failed inner blocks are replaced by the all-zero m-bit symbol;
+ *  - the outer received word is passed directly to the ordinary Newton
+ *    syndrome engine and FR-VOTE.  No outer Gen/VG/nullspace matrix is built.
+ * The basis evaluations below are used only by this Monte-Carlo encoder to
+ * create a valid transmitted outer word; they are not used by the decoder.
+ */
+static int ag_concat_frvote_run(int npts, int kcode, int outer_m,
+                                const char *inner_spec, unsigned poly,
+                                int trials, int nerr, int verbose,
+                                int showv, int burst, int interleave) {
+  int spec_m = 0;
+  if (!inner_spec || sscanf(inner_spec, "goppa:%d", &spec_m) != 1) {
+    fprintf(stderr, "ERROR: AG concatenation requires --concat-inner goppa:m:t[:n].\n");
+    return 2;
+  }
+  if (spec_m != outer_m || outer_m != FM) {
+    fprintf(stderr, "ERROR: inner Goppa and outer AG must use the same GF(2^m): inner=%d outer=%d active=%d.\n",
+            spec_m, outer_m, FM);
+    return 2;
+  }
+  BinCode *In = bc_parse(inner_spec, poly);
+  if (In->kind != BC_GOPPA || !In->alt || !In->info) {
+    fprintf(stderr, "ERROR: inner code must be a binary Goppa code with an information-bit map.\n");
+    bc_free(In);
+    return 2;
+  }
+  if (In->k != outer_m) {
+    fprintf(stderr, "ERROR: inner binary Goppa dimension must equal m exactly: k=%d, m=%d.\n",
+            In->k, outer_m);
+    bc_free(In);
+    return 2;
+  }
+  if (npts <= 0 || kcode <= 0 || kcode >= npts || trials <= 0) {
+    fprintf(stderr, "ERROR: invalid outer AG dimensions or trial count.\n");
+    bc_free(In);
+    return 2;
+  }
+  long long total64 = (long long)npts * In->n;
+  if (total64 > 200000000LL || total64 > 2147483647LL) {
+    fprintf(stderr, "ERROR: concatenated block length exceeds this build's limit.\n");
+    bc_free(In);
+    return 2;
+  }
+  int total = (int)total64, ni = In->n, m = outer_m;
+  if (nerr < 0 || nerr > total) {
+    fprintf(stderr, "ERROR: --errors must be in 0..%d for this concatenated code.\n", total);
+    bc_free(In);
+    return 2;
+  }
+  if (interleave < 1 || interleave > 256) {
+    fprintf(stderr, "ERROR: --interleave must be in 1..256.\n");
+    bc_free(In);
+    return 2;
+  }
+  if (interleave > npts) interleave = npts;
+  if (burst && nerr > ni * interleave) {
+    fprintf(stderr, "ERROR: burst length exceeds first interleaver group (%d bits).\n", ni * interleave);
+    bc_free(In);
+    return 2;
+  }
+
+  init_semigroup();
+  ASHIFT = basis[1].rho;
+  ROW_MAX = M_SYND - ASHIFT;
+  if (ROW_MAX <= 0) {
+    fprintf(stderr, "ERROR: invalid FR-VOTE reduction range (M=%d, shift=%d).\n",
+            M_SYND, ASHIFT);
+    bc_free(In);
+    return 2;
+  }
+  if (!nz_idx) {
+    nz_idx = malloc(sizeof(int) * (size_t)npts);
+    if (!nz_idx) {
+      fprintf(stderr, "ERROR: cannot allocate AG syndrome support index.\n");
+      bc_free(In);
+      return 2;
+    }
+  }
+  int *basis_rows = malloc(sizeof(int) * (size_t)kcode);
+  int br = 0;
+  if (!basis_rows) {
+    fprintf(stderr, "ERROR: out of memory selecting outer AG checks.\n");
+    bc_free(In);
+    return 2;
+  }
+  for (int i = 0; i < nbasis; ++i)
+    if (basis[i].rho <= M_SYND && br < kcode)
+      basis_rows[br++] = i;
+  if (br != kcode) {
+    fprintf(stderr, "ERROR: could not identify the %d outer Newton check functions.\n", kcode);
+    free(basis_rows);
+    bc_free(In);
+    return 2;
+  }
+
+  /* Find kcode independent columns of the AG check map H by incremental
+     elimination.  This small pivot block is used only to create test
+     codewords; the decoder never constructs or uses H, Gen, or VG. */
+  fe *ech = calloc((size_t)kcode * kcode, sizeof(fe));
+  fe *pivot_matrix = calloc((size_t)kcode * kcode, sizeof(fe));
+  fe *colv = malloc(sizeof(fe) * (size_t)kcode);
+  int *pivot_pos = malloc(sizeof(int) * (size_t)kcode);
+  uint8_t *ech_used = calloc((size_t)kcode, 1);
+  uint8_t *is_pivot = calloc((size_t)npts, 1);
+  if (!ech || !pivot_matrix || !colv || !pivot_pos || !ech_used || !is_pivot) {
+    fprintf(stderr, "ERROR: out of memory preparing the outer AG test encoder.\n");
+    free(basis_rows); free(ech); free(pivot_matrix); free(colv);
+    free(pivot_pos); free(ech_used); free(is_pivot); bc_free(In);
+    return 2;
+  }
+  int rank = 0;
+  for (int x = 0; x < npts && rank < kcode; ++x) {
+    for (int a = 0; a < kcode; ++a)
+      colv[a] = basis_value_at(basis_rows[a], x);
+    for (int r0 = 0; r0 < kcode; ++r0) {
+      if (!colv[r0]) continue;
+      if (ech_used[r0]) {
+        fe f = colv[r0]; /* echelon pivot is normalized to one */
+        for (int j = r0; j < kcode; ++j)
+          colv[j] ^= mul(f, ech[(size_t)r0 * kcode + j]);
+      } else {
+        fe iv = inv(colv[r0]);
+        for (int j = r0; j < kcode; ++j)
+          ech[(size_t)r0 * kcode + j] = mul(colv[j], iv);
+        ech_used[r0] = 1;
+        pivot_pos[rank] = x;
+        is_pivot[x] = 1;
+        for (int a = 0; a < kcode; ++a)
+          pivot_matrix[(size_t)a * kcode + rank] =
+              basis_value_at(basis_rows[a], x);
+        ++rank;
+        break;
+      }
+    }
+  }
+  if (rank != kcode) {
+    fprintf(stderr, "ERROR: AG check map has only %d independent columns; need %d.\n", rank, kcode);
+    free(basis_rows); free(ech); free(pivot_matrix); free(colv);
+    free(pivot_pos); free(ech_used); free(is_pivot); bc_free(In);
+    return 2;
+  }
+  free(ech); free(colv); free(ech_used);
+
+  fe *cw = calloc((size_t)npts, sizeof(fe));
+  fe *received = calloc((size_t)npts, sizeof(fe));
+  fe *corrected = calloc((size_t)npts, sizeof(fe));
+  fe *aug = malloc(sizeof(fe) * (size_t)kcode * (size_t)(kcode + 1));
+  uint8_t *bits = malloc((size_t)total);
+  uint8_t *txbits = malloc((size_t)total);
+  uint8_t *work = malloc((size_t)ni);
+  uint8_t *dec = malloc((size_t)ni);
+  uint8_t *reenc = malloc((size_t)ni);
+  uint8_t *ib = calloc((size_t)In->k, 1);
+  int *ep = malloc(sizeof(int) * (size_t)(nerr ? nerr : 1));
+  if (!cw || !received || !corrected || !aug || !bits || !txbits ||
+      !work || !dec || !reenc || !ib || !ep) {
+    fprintf(stderr, "ERROR: out of memory in AG/Goppa FR-VOTE concatenation.\n");
+    free(basis_rows); free(pivot_matrix); free(pivot_pos); free(is_pivot);
+    free(cw); free(received); free(corrected); free(aug);
+    free(bits); free(txbits); free(work); free(dec); free(reenc); free(ib); free(ep);
+    bc_free(In);
+    return 2;
+  }
+
+  int outer_k = npts - kcode;
+  int successes = 0, detected = 0, wrong = 0;
+  int inner_failures = 0, outer_errors_total = 0, max_outer_errors = 0;
+  double enc_total = 0.0, dec_total = 0.0;
+  printf("# concatenated code: outer AG[n=%d,k=%d] over GF(2^%d), inner binary %s [n=%d,k=%d]\n",
+         npts, outer_k, m, In->name, ni, In->k);
+  printf("# binary length N=%d, dimension K=%d; Goppa t=%d; interleave D=%d\n",
+         total, outer_k * m, In->t, interleave);
+  printf("# outer checks: %d Newton basis functions; decoder uses direct syndromes (no Gen/VG)\n", kcode);
+  printf("# outer decoder: Newton syndrome + FR-VOTE; failed inner blocks become zero symbols\n");
+
+  for (int tr = 0; tr < trials; ++tr) {
+    double t0 = now();
+    /* Random information coordinates, then solve only for the pivot
+       coordinates so that every Newton check sum_a c_a h_a(P) is zero. */
+    memset(cw, 0, sizeof(fe) * (size_t)npts);
+    for (int x = 0; x < npts; ++x)
+      if (!is_pivot[x])
+        cw[x] = (fe)(rnd() % (uint64_t)FS);
+    for (int a = 0; a < kcode; ++a) {
+      fe v = 0;
+      for (int x = 0; x < npts; ++x)
+        if (!is_pivot[x])
+          v ^= mul(cw[x], basis_value_at(basis_rows[a], x));
+      for (int j = 0; j < kcode; ++j)
+        aug[(size_t)a * (kcode + 1) + j] =
+            pivot_matrix[(size_t)a * kcode + j];
+      aug[(size_t)a * (kcode + 1) + kcode] = v;
+    }
+    /* Solve H_P c_P = H_free c_free over GF(2^m). */
+    for (int c = 0; c < kcode; ++c) {
+      int p0 = c;
+      while (p0 < kcode && !aug[(size_t)p0 * (kcode + 1) + c]) ++p0;
+      if (p0 == kcode) {
+        fprintf(stderr, "ERROR: singular outer AG encoder pivot system.\n");
+        free(basis_rows); free(pivot_matrix); free(pivot_pos); free(is_pivot);
+        free(cw); free(received); free(corrected); free(aug);
+        free(bits); free(txbits); free(work); free(dec); free(reenc); free(ib); free(ep);
+        bc_free(In);
+        return 2;
+      }
+      if (p0 != c)
+        for (int j = c; j <= kcode; ++j) {
+          fe z = aug[(size_t)c * (kcode + 1) + j];
+          aug[(size_t)c * (kcode + 1) + j] = aug[(size_t)p0 * (kcode + 1) + j];
+          aug[(size_t)p0 * (kcode + 1) + j] = z;
+        }
+      fe iv = inv(aug[(size_t)c * (kcode + 1) + c]);
+      for (int j = c; j <= kcode; ++j)
+        aug[(size_t)c * (kcode + 1) + j] =
+            mul(aug[(size_t)c * (kcode + 1) + j], iv);
+      for (int a = 0; a < kcode; ++a) {
+        if (a == c) continue;
+        fe f = aug[(size_t)a * (kcode + 1) + c];
+        if (!f) continue;
+        for (int j = c; j <= kcode; ++j)
+          aug[(size_t)a * (kcode + 1) + j] ^=
+              mul(f, aug[(size_t)c * (kcode + 1) + j]);
+      }
+    }
+    for (int j = 0; j < kcode; ++j)
+      cw[pivot_pos[j]] = aug[(size_t)j * (kcode + 1) + kcode];
+    /* Check the generated outer word before it enters the binary inner code. */
+    for (int a = 0; a < kcode; ++a) {
+      fe check = 0;
+      for (int x = 0; x < npts; ++x)
+        check ^= mul(cw[x], basis_value_at(basis_rows[a], x));
+      if (check) {
+        fprintf(stderr, "ERROR: test encoder produced a nonzero outer syndrome at row %d.\n", a);
+        free(basis_rows); free(pivot_matrix); free(pivot_pos); free(is_pivot);
+        free(cw); free(received); free(corrected); free(aug);
+        free(bits); free(txbits); free(work); free(dec); free(reenc); free(ib); free(ep);
+        bc_free(In);
+        return 2;
+      }
+    }
+    for (int x = 0; x < npts; ++x) {
+      for (int b = 0; b < m; ++b)
+        ib[b] = (uint8_t)((cw[x] >> b) & 1u);
+      bc_encode(In, ib, bits + (size_t)x * ni);
+    }
+    if (interleave == 1) {
+      memcpy(txbits, bits, (size_t)total);
+    } else {
+      for (int base = 0; base < npts; base += interleave) {
+        int width = npts - base;
+        if (width > interleave) width = interleave;
+        size_t txbase = (size_t)base * ni;
+        for (int j = 0; j < ni; ++j)
+          for (int b = 0; b < width; ++b)
+            txbits[txbase + (size_t)j * width + b] =
+                bits[(size_t)(base + b) * ni + j];
+      }
+    }
+    enc_total += now() - t0;
+
+    if (nerr) {
+      if (burst) {
+        int span = ni * interleave;
+        int start = (int)(rnd() % (uint64_t)(span - nerr + 1));
+        for (int e = 0; e < nerr; ++e) ep[e] = start + e;
+      } else {
+        pick(total, nerr, ep, NULL);
+      }
+    }
+    for (int e = 0; e < nerr; ++e) txbits[ep[e]] ^= 1u;
+    if (interleave == 1) {
+      memcpy(bits, txbits, (size_t)total);
+    } else {
+      for (int base = 0; base < npts; base += interleave) {
+        int width = npts - base;
+        if (width > interleave) width = interleave;
+        size_t txbase = (size_t)base * ni;
+        for (int j = 0; j < ni; ++j)
+          for (int b = 0; b < width; ++b)
+            bits[(size_t)(base + b) * ni + j] =
+                txbits[txbase + (size_t)j * width + b];
+      }
+    }
+
+    t0 = now();
+    int failed_blocks = 0;
+    for (int x = 0; x < npts; ++x) {
+      memcpy(work, bits + (size_t)x * ni, (size_t)ni);
+      int dr = bc_decode(In, work, NULL, dec);
+      if (dr < 0) {
+        ++failed_blocks;
+        ++inner_failures;
+        received[x] = 0;
+        continue;
+      }
+      fe sym = 0;
+      for (int b = 0; b < m; ++b) {
+        ib[b] = dec[In->info[b]] & 1u;
+        sym |= (fe)(ib[b] << b);
+      }
+      bc_encode(In, ib, reenc);
+      if (memcmp(reenc, dec, (size_t)ni) != 0) {
+        ++failed_blocks;
+        ++inner_failures;
+        received[x] = 0;
+      } else {
+        received[x] = sym;
+      }
+    }
+
+    /* The outer codeword has zero AG syndrome.  Therefore the syndrome of
+       this received symbol word is exactly the syndrome of its unknown error
+       vector; do not form that error vector or a parity-check matrix. */
+    int outer_weight = 0;
+    for (int x = 0; x < npts; ++x) {
+      fe ev = received[x] ^ cw[x];
+      if (ev) {
+        if (outer_weight >= MAXT) {
+          fprintf(stderr, "ERROR: outer symbol-error count exceeds decoder capacity (%d).\n", MAXT);
+          free(basis_rows); free(pivot_matrix); free(pivot_pos); free(is_pivot);
+          free(cw); free(received); free(corrected); free(aug);
+          free(bits); free(txbits); free(work); free(dec); free(reenc); free(ib); free(ep);
+          bc_free(In);
+          return 2;
+        }
+        true_pos[outer_weight] = x;
+        true_val[outer_weight] = ev;
+        ++outer_weight;
+      }
+    }
+    NUM_ERRORS = outer_weight; /* diagnostics/verification only */
+    outer_errors_total += outer_weight;
+    if (outer_weight > max_outer_errors) max_outer_errors = outer_weight;
+    Result outer_result;
+    memset(&outer_result, 0, sizeof outer_result);
+    int drc = 0;
+    int solved = (outer_weight == 0);
+    if (outer_weight != 0) {
+      set_received(received);
+      drc = decode_fr_vote(&outer_result, verbose, trials > 1);
+      solved = drc == 0 && !outer_result.failed && outer_result.resolved &&
+               !outer_result.overflow;
+    }
+    memcpy(corrected, received, sizeof(fe) * (size_t)npts);
+    if (solved) {
+      for (int q = 0; q < outer_result.nfound; ++q)
+        corrected[outer_result.pos[q]] ^= outer_result.val[q];
+      solved = memcmp(corrected, cw, sizeof(fe) * (size_t)npts) == 0;
+    }
+    dec_total += now() - t0;
+    if (solved) ++successes;
+    else if (drc != 0 || outer_result.failed || !outer_result.resolved || outer_result.overflow)
+      ++detected;
+    else
+      ++wrong;
+
+    if (trials == 1 || verbose)
+      printf("# trial %d: %d channel bit errors -> %d inner decode failures, %d outer symbol errors -> %s\n",
+             tr + 1, nerr, failed_blocks, outer_weight,
+             solved ? "EXACT RECOVERY" : (drc != 0 || outer_result.failed || !outer_result.resolved ? "DETECTED FAILURE" : "WRONG OUTER WORD"));
+    if (showv && solved && outer_weight)
+      printf("# outer FR-VOTE recovered %d symbol errors exactly\n", outer_weight);
+  }
+
+  printf("\n# AG/Goppa concatenation (Niederreiter outer syndrome): %s\n",
+         successes == trials ? "[OK]" : "[FAIL]");
+  printf("# Exact recoveries : %d/%d\n", successes, trials);
+  printf("# Detected failures: %d\n", detected);
+  printf("# Wrong outer words: %d\n", wrong);
+  printf("# Inner Goppa decode failures: %d\n", inner_failures);
+  printf("# Outer symbol errors: average %.2f, maximum %d\n",
+         trials ? (double)outer_errors_total / trials : 0.0, max_outer_errors);
+  printf("# Average encode   : %.6f s\n", enc_total / trials);
+  printf("# Average decode   : %.6f s\n", dec_total / trials);
+  printf("# RESULT: %s\n", successes == trials ? "PASS" : "FAIL");
+
+  free(basis_rows); free(pivot_matrix); free(pivot_pos); free(is_pivot);
+  free(cw); free(received); free(corrected); free(aug);
+  free(bits); free(txbits); free(work); free(dec); free(reenc); free(ib); free(ep);
+  bc_free(In);
+  return successes == trials ? 0 : 1;
+}
+
 static int ag_concat_run(const fe *Gen, const fe *VG, int npts, int kcode,
                          int rG, int outer_m, const char *inner_spec,
                          unsigned poly, int trials, int nerr, int verbose,
