@@ -339,6 +339,59 @@ AG
 ./unified_codes --family ag -limits
 ```
 
+## AG 符号のパラメータ候補表示（`--suggest-param`）
+
+`--suggest-param` は、選択した AG 曲線について、実際に列挙された種数 `g` と
+アフィン評価位置数 `n` を使い、1点 AG 符号のシンドローム境界 `M` の候補を
+表示して終了します。復号試行は行いません。`M` の大きい候補から降順に表示し、
+候補数が多い場合はおよそ100行に間引きます（最小値・最大値は表示します）。
+
+```sh
+# BBGS over GF(64): genus and point count are obtained from this curve instance
+./unified_codes --family ag --m 6 --curve bbgs \
+  --q 4 --a 1 --b 2 --errors 10 --suggest-param
+
+# Suzuki: use the dedicated Suzuki engine
+./unified_codes --family ag --m 12 --curve suzuki \
+  --q 8 --errors 20 --suggest-param
+```
+
+出力列の意味：
+
+| 列 | 意味 |
+|---|---|
+| `M` | シンドローム境界・極次数の候補 |
+| `k_RR` | Riemann--Roch 次元の式 `M-g+1` |
+| `rate` | `k_RR/n` による設計上の符号化率 |
+| `t_FR/BMS` | FR/BMS の基本境界から計算した誤り数上限 |
+| `t_vote` | 多数決復号の設計境界から計算した誤り数上限 |
+
+候補範囲は `M >= 2g` と、評価写像・ビルド上限から得られる
+`M <= min(n-g-2, MAXB-2)` です。表示する訂正数は、次の設計境界を整数化した値です。
+
+\[
+ t_{FR/BMS}=\left\lfloor\frac{M-3g+1}{2}\right\rfloor,\qquad
+ t_{vote}=\left\lfloor\frac{M-2g+1}{2}\right\rfloor.
+\]
+
+`--errors t` を同時に指定すると、その誤り数に必要な最小 `M` も表示します。
+
+\[
+ M_{FR/BMS}\ge 2t+3g-1,\qquad
+ M_{vote}\ge 2t+2g.
+\]
+
+必要な `M` が評価位置数またはビルド上限を超える場合は、実現不可と表示します。
+`k_RR=M-g+1` は Riemann--Roch 次元の式による値であり、実際に使える符号次元や
+復号性能を無条件に保証するものではありません。復号には基底の構成・認証など、
+曲線と実装側の条件も関係します。また、この機能は選択済み曲線の候補を表示するもので、
+曲線族・有限体・`q,a,b` を横断して最適な曲線を自動探索する機能ではありません。
+RSRM・Goppa との比較や連接符号のパラメータ最適化も行いません。
+
+この実装では、通常の AG 曲線経路と Suzuki 専用エンジンで候補表示を行います。
+Miura 曲線のエンジンは含まれていないため、`--suggest-param` で Miura 曲線を
+探索することはできません。
+
 ## 主なオプション
 
 オプションの全一覧と各符号固有の指定は、必ず実行ファイルのヘルプを参照してください。
@@ -384,6 +437,7 @@ AG
   `--terms SPEC`     平面曲線の項を指定
   `--pole SPEC`      多点極因子を指定
   `--M M`            シンドローム境界・極次数
+  `--suggest-param`  選択したAG曲線の1点符号パラメータ候補を表示して終了
   `-fr -bms -vote`   1 点復号器の選択
   `-frvote`          Feng--Rao 多数決復号経路
   `-ecp`             ECP復号（1点AG、または古典RS/GRS）
