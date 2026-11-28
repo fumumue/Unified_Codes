@@ -9948,6 +9948,96 @@ static BinCode *bc_parse(const char *spec, unsigned poly) {
   return NULL;
 }
 
+
+/* ================= same-rate benchmark =================
+ * Compare binary code families supported by bc_parse().  Each candidate is
+ * tested with the same PRNG initial state; timings are per block. */
+static int benchmark_rate(const char *specs, double target, double tol,
+                          int trials, int fixed_errors, uint64_t seed,
+                          unsigned poly) {
+  if (!specs || !*specs || !(target > 0.0 && target <= 1.0) ||
+      tol < 0.0 || trials < 1) {
+    fprintf(stderr, "invalid --compare / --rate / --rate-tol / -n value\n");
+    return 2;
+  }
+  char *list = strdup(specs);
+  if (!list) die("out of memory");
+  uint64_t saved_rng = rng_s;
+  uint64_t base_rng = saved_rng ^ (seed * 0x9E3779B97F4A7C15ULL);
+  printf("# same-rate benchmark: target=%.6f tolerance=%.6f trials=%d\n",
+         target, tol, trials);
+  printf("# spec | code | n | k | rate | enc_ms/block | dec_ms/block | failures | fail_rate\n");
+  int tested = 0;
+  char *p = list;
+  while (*p) {
+    char *comma = strchr(p, ',');
+    if (comma) *comma = '\0';
+    while (*p == ' ' || *p == '\t') ++p;
+    char *end = p + strlen(p);
+    while (end > p && (end[-1] == ' ' || end[-1] == '\t')) *--end = '\0';
+    if (*p) {
+      rng_s = base_rng;
+      BinCode *B = bc_parse(p, poly);
+      double rate = (double)B->k / (double)B->n;
+      if (rate < target - tol || rate > target + tol) {
+        printf("# skip %s: rate %.6f outside [%.6f, %.6f]\n",
+               p, rate, target - tol, target + tol);
+      } else {
+        int errors = fixed_errors >= 0 ? fixed_errors : B->t;
+        if (errors < 0 || errors > B->n) {
+          fprintf(stderr, "invalid error count %d for %s (n=%d)\n",
+                  errors, p, B->n);
+          bc_free(B); free(list); rng_s = saved_rng; return 2;
+        }
+        uint8_t *msg = malloc((size_t)B->k);
+        uint8_t *cw = malloc((size_t)B->n);
+        uint8_t *rv = malloc((size_t)B->n);
+        uint8_t *dec = malloc((size_t)B->n);
+        int *perm = malloc(sizeof(int) * (size_t)B->n);
+        if (!msg || !cw || !rv || !dec || !perm)
+          die("out of memory in rate benchmark");
+        uint64_t trial_rng = rng_s;
+        double enc_total = 0.0, dec_total = 0.0;
+        int failures = 0;
+        for (int tr = 0; tr < trials; ++tr) {
+          for (int j = 0; j < B->k; ++j)
+            msg[j] = (uint8_t)(rnd() & 1u);
+          double t0 = now();
+          bc_encode(B, msg, cw);
+          enc_total += now() - t0;
+          memcpy(rv, cw, (size_t)B->n);
+          for (int j = 0; j < B->n; ++j) perm[j] = j;
+          for (int j = 0; j < errors; ++j) {
+            int q = j + (int)(rnd() % (uint64_t)(B->n - j));
+            int z = perm[j]; perm[j] = perm[q]; perm[q] = z;
+            rv[perm[j]] ^= 1;
+          }
+          t0 = now();
+          int rc = bc_decode(B, rv, NULL, dec);
+          dec_total += now() - t0;
+          if (rc < 0 || memcmp(dec, cw, (size_t)B->n) != 0)
+            ++failures;
+        }
+        rng_s = trial_rng;
+        printf("%s | %s | %d | %d | %.6f | %.6f | %.6f | %d/%d | %.6f\n",
+               p, B->name, B->n, B->k, rate,
+               1000.0 * enc_total / trials, 1000.0 * dec_total / trials,
+               failures, trials, (double)failures / trials);
+        ++tested;
+        free(msg); free(cw); free(rv); free(dec); free(perm);
+      }
+      bc_free(B);
+    }
+    if (!comma) break;
+    p = comma + 1;
+  }
+  free(list);
+  rng_s = saved_rng;
+  if (!tested)
+    fprintf(stderr, "no candidate matched the requested rate window\n");
+  return tested ? 0 : 1;
+}
+
 /* ================= GRS ================= */
 typedef struct {
   GF *F;
@@ -11676,6 +11766,480 @@ static int ag_concat_run(const fe *Gen, const fe *VG, int npts, int kcode,
   return successes == trials ? 0 : 1;
 }
 
+/* ================= decoding failure probability (DFR) =====================
+ * --dfr --ber p     probability that the decoder does not return the
+ *                   transmitted word when every bit of a block is flipped
+ *                   independently with probability p (binary symmetric
+ *                   channel), computed in the same two layers as the HQC
+ *                   analysis:
+ *     inner block   P(w errors) = Binomial(n,p)(w); for every weight w the
+ *                   outcome (correct / detected failure / miscorrection) of
+ *                   the real inner decoder is measured by Monte Carlo at
+ *                   FIXED weight w (w <= t: always correct, no sampling).
+ *     outer code    the block outcomes are iid, so the outer failure
+ *                   probability  P(2E + S > D)  (E miscorrected blocks, S
+ *                   detected failures, D = n_out - k_out) is an exact
+ *                   multinomial sum, evaluated in the log domain (long
+ *                   double), so values like 2^-128 are no problem.
+ * Exact, no sampling: bch / alt / goppa / srivastava / gs / golay (strict
+ * bounded-distance decoders: DFR = P(Bin(n,p) > t)) and rs / grs.
+ * Monte Carlo per weight: rm / hadamard / ldpc, and the inner code of concat.
+ * --dfr-sim N cross-checks the result by N end-to-end simulations.
+ */
+typedef struct {
+  long T, nA, nB;
+} DfrCell;
+
+static long double dfr_lf(int n) { return lgammal((long double)n + 1.0L); }
+static long double dfr_lbin(int n, int k) {
+  return dfr_lf(n) - dfr_lf(k) - dfr_lf(n - k);
+}
+/* log of the Binomial(n,p) probability mass at w */
+static long double dfr_lpmf(int n, int w, long double p) {
+  if (w < 0 || w > n)
+    return -INFINITY;
+  if (p <= 0.0L)
+    return w == 0 ? 0.0L : -INFINITY;
+  if (p >= 1.0L)
+    return w == n ? 0.0L : -INFINITY;
+  return dfr_lbin(n, w) + (long double)w * logl(p) +
+         (long double)(n - w) * log1pl(-p);
+}
+static long double dfr_lse(long double x, long double y) {
+  if (x == -INFINITY)
+    return y;
+  if (y == -INFINITY)
+    return x;
+  if (x < y) {
+    long double t = x;
+    x = y;
+    y = t;
+  }
+  return x + log1pl(expl(y - x));
+}
+/* P(Bin(n,p) > t) */
+static long double dfr_tail(int n, long double p, int t) {
+  long double acc = -INFINITY;
+  for (int w = t + 1; w <= n; ++w)
+    acc = dfr_lse(acc, dfr_lpmf(n, w, p));
+  return acc == -INFINITY ? 0.0L : expl(acc);
+}
+/* Outer failure probability for n iid blocks, each a miscorrection with
+ * probability b, a detected failure (erasure) with probability a and correct
+ * otherwise: P(2E + S > D), the exact errors-and-erasures condition of the
+ * GRS decoder.  Summed directly over the failing (E,S), never as 1 - P(ok). */
+static long double dfr_outer(int n, int D, long double a, long double b) {
+  long double c = 1.0L - a - b;
+  if (c < 0.0L)
+    c = 0.0L;
+  long double la = a > 0 ? logl(a) : -INFINITY;
+  long double lb = b > 0 ? logl(b) : -INFINITY;
+  long double lc = c > 0.0L ? log1pl(-(a + b)) : -INFINITY;
+  long double *lf = malloc(sizeof(long double) * (size_t)(n + 1));
+  if (!lf)
+    die("out of memory");
+  for (int i = 0; i <= n; ++i)
+    lf[i] = lgammal((long double)i + 1.0L);
+  long double acc = -INFINITY;
+  for (int e = 0; e <= n; ++e) {
+    if (e > 0 && b <= 0.0L)
+      break;
+    for (int s = 0; s + e <= n; ++s) {
+      if (s > 0 && a <= 0.0L)
+        break;
+      if (2 * e + s <= D)
+        continue;
+      int r = n - e - s;
+      if (r > 0 && c <= 0.0L)
+        continue;
+      long double t = lf[n] - lf[e] - lf[s] - lf[r];
+      if (e)
+        t += (long double)e * lb;
+      if (s)
+        t += (long double)s * la;
+      if (r)
+        t += (long double)r * lc;
+      acc = dfr_lse(acc, t);
+    }
+  }
+  free(lf);
+  return acc == -INFINITY ? 0.0L : expl(acc);
+}
+/* Wilson score interval for cnt successes in T trials */
+static void dfr_wilson(long cnt, long T, long double z, long double *lo,
+                       long double *hi) {
+  if (T <= 0) {
+    *lo = 0.0L;
+    *hi = 1.0L;
+    return;
+  }
+  long double ph = (long double)cnt / (long double)T, z2 = z * z;
+  long double den = 1.0L + z2 / (long double)T;
+  long double c = (ph + z2 / (2.0L * (long double)T)) / den;
+  long double h =
+      z *
+      sqrtl(ph * (1.0L - ph) / (long double)T +
+            z2 / (4.0L * (long double)T * (long double)T)) /
+      den;
+  *lo = cnt == 0 ? 0.0L : (c - h < 0.0L ? 0.0L : c - h);
+  *hi = cnt == T ? 1.0L : (c + h > 1.0L ? 1.0L : c + h);
+}
+static void dfr_bsc(uint8_t *v, int n, long double p) {
+  uint64_t thr = p >= 1.0L ? ~0ULL : (uint64_t)(p * 18446744073709551616.0L);
+  for (int i = 0; i < n; ++i)
+    if (rnd() < thr)
+      v[i] ^= 1;
+}
+static void dfr_print(const char *tag, long double v) {
+  if (v <= 0.0L)
+    printf("# %s = 0\n", tag);
+  else
+    printf("# %s = %.6Le  (2^%.2Lf)\n", tag, v, log2l(v));
+}
+static void dfr_print_range(const char *tag, long double lo, long double pt,
+                            long double hi) {
+  if (pt <= 0.0L && hi <= 0.0L) {
+    printf("# %s = 0\n", tag);
+    return;
+  }
+  printf("# %s = %.4Le  (2^%.2Lf)   bracket [%.3Le, %.3Le] = [2^%.2Lf, "
+         "2^%.2Lf]\n",
+         tag, pt, pt > 0 ? log2l(pt) : -INFINITY, lo, hi,
+         lo > 0 ? log2l(lo) : -INFINITY, hi > 0 ? log2l(hi) : -INFINITY);
+}
+/* one inner trial at exactly w bit errors.  symbits == 0: plain code (random
+ * k-bit message).  symbits == m: concat inner block (m random message bits,
+ * the rest shortened to zero), classified exactly as run_concat does.
+ * returns 0 = correct, 1 = detected failure (erasure), 2 = miscorrection */
+static int dfr_trial(const BinCode *B, int symbits, int w, int *perm,
+                     uint8_t *msg, uint8_t *cw, uint8_t *rv, uint8_t *dec) {
+  int n = B->n, k = B->k;
+  for (int j = 0; j < k; ++j)
+    msg[j] = (uint8_t)((symbits == 0 || j < symbits) ? (rnd() & 1) : 0);
+  bc_encode(B, msg, cw);
+  memcpy(rv, cw, (size_t)n);
+  for (int i = 0; i < w; ++i) {
+    int j = i + (int)(rnd() % (uint64_t)(n - i));
+    int tmp = perm[i];
+    perm[i] = perm[j];
+    perm[j] = tmp;
+    rv[perm[i]] ^= 1;
+  }
+  int res = bc_decode(B, rv, NULL, dec);
+  if (res < 0)
+    return 1;
+  if (symbits == 0)
+    return memcmp(dec, cw, (size_t)n) ? 2 : 0;
+  int bad = 0, diff = 0;
+  for (int j = 0; j < k; ++j) {
+    uint8_t v = dec[B->info[j]];
+    if (j < symbits)
+      diff |= v != msg[j];
+    else if (v)
+      bad = 1;
+  }
+  if (bad)
+    return 1;
+  return diff ? 2 : 0;
+}
+/* Measure the inner decoder at every weight that matters under BSC(p) and
+ * combine with the binomial weights.  a[]/b[] = detected-failure /
+ * miscorrection probability of one block as {lower, point, upper}.
+ * Pass 1 runs T trials at every weight with probability >= 2^-300; pass 2
+ * keeps adding trials to the weight whose Wilson (z = 4) uncertainty
+ * P(w)*(hi-pt) is largest, until the total uncertainty is below g_dfr_prec
+ * times the total failure probability, g_dfr_max trials per weight or a
+ * global budget of 20*g_dfr_max extra trials.  The bracket uses the Wilson
+ * bounds and counts all neglected mass in the upper end. */
+static double g_dfr_prec = 0.3;
+static long g_dfr_max = 200000;
+typedef struct {
+  int w;
+  long double pi;
+  long T, nA, nB;
+} DfrW;
+static void dfr_scan(const BinCode *B, int symbits, long double p, int T,
+                     int verbose, long double a[3], long double b[3],
+                     long double *pruned) {
+  int n = B->n;
+  int w0 = (B->kind == BC_LDPC) ? 1 : B->t + 1; /* w <= t: always decoded */
+  if (w0 < 1)
+    w0 = 1;
+  const long double z = 4.0L, cut = -300.0L * logl(2.0L);
+  uint8_t *msg = malloc((size_t)B->k), *cw = malloc((size_t)n),
+          *rv = malloc((size_t)n), *dec = malloc((size_t)n);
+  int *perm = malloc(sizeof(int) * (size_t)n);
+  DfrW *W = malloc(sizeof(DfrW) * (size_t)(n + 1));
+  if (!msg || !cw || !rv || !dec || !perm || !W)
+    die("out of memory");
+  for (int i = 0; i < n; ++i)
+    perm[i] = i;
+  for (int i = 0; i < 3; ++i)
+    a[i] = b[i] = 0.0L;
+  *pruned = 0.0L;
+  int nw = 0;
+  for (int w = w0; w <= n; ++w) {
+    long double lp = dfr_lpmf(n, w, p);
+    if (lp < cut) {
+      *pruned += expl(lp);
+      continue;
+    }
+    W[nw].w = w;
+    W[nw].pi = expl(lp);
+    W[nw].T = W[nw].nA = W[nw].nB = 0;
+    ++nw;
+  }
+#define DFR_RUN(i, cnt)                                                        \
+  do {                                                                         \
+    for (long tr_ = 0; tr_ < (cnt); ++tr_) {                                   \
+      int cls_ = dfr_trial(B, symbits, W[i].w, perm, msg, cw, rv, dec);        \
+      W[i].nA += cls_ == 1;                                                    \
+      W[i].nB += cls_ == 2;                                                    \
+    }                                                                          \
+    W[i].T += (cnt);                                                           \
+  } while (0)
+  for (int i = 0; i < nw; ++i)
+    DFR_RUN(i, (long)T);
+  long budget = 20 * g_dfr_max;
+  for (;;) {
+    long double spt = 0.0L, su = 0.0L, best = 0.0L;
+    int bi = -1;
+    for (int i = 0; i < nw; ++i) {
+      long F = W[i].nA + W[i].nB;
+      long double ptF = (long double)F / (long double)W[i].T, lo, hi;
+      dfr_wilson(F, W[i].T, z, &lo, &hi);
+      long double u = W[i].pi * (hi - ptF);
+      spt += W[i].pi * ptF;
+      su += u;
+      if (W[i].T < g_dfr_max && u > best) {
+        best = u;
+        bi = i;
+      }
+    }
+    if (bi < 0 || budget <= 0)
+      break;
+    if (spt > 0.0L && su <= (long double)g_dfr_prec * spt)
+      break;
+    long add = W[bi].T;
+    if (W[bi].T + add > g_dfr_max)
+      add = g_dfr_max - W[bi].T;
+    if (add > budget)
+      add = budget;
+    DFR_RUN(bi, add);
+    budget -= add;
+  }
+#undef DFR_RUN
+  long double dom = 0.0L;
+  int domw = -1;
+  if (verbose)
+    printf("# weight  P(weight)      detected          miscorrected      "
+           "trials\n");
+  for (int i = 0; i < nw; ++i) {
+    long double alo, ahi, blo, bhi, pi = W[i].pi, Tl = (long double)W[i].T;
+    dfr_wilson(W[i].nA, W[i].T, z, &alo, &ahi);
+    dfr_wilson(W[i].nB, W[i].T, z, &blo, &bhi);
+    a[0] += pi * alo;
+    a[1] += pi * (long double)W[i].nA / Tl;
+    a[2] += pi * ahi;
+    b[0] += pi * blo;
+    b[1] += pi * (long double)W[i].nB / Tl;
+    b[2] += pi * bhi;
+    long double contrib = pi * (long double)(W[i].nA + W[i].nB) / Tl;
+    if (contrib > dom) {
+      dom = contrib;
+      domw = W[i].w;
+    }
+    if (verbose)
+      printf("# %5d   %.3Le   %8ld/%-8ld %8ld/%-8ld %ld\n", W[i].w, pi,
+             W[i].nA, W[i].T, W[i].nB, W[i].T, W[i].T);
+  }
+  b[2] += *pruned; /* unresolved mass counted as the worst case */
+  if (domw >= 0)
+    printf("# most of the failure probability comes from weight %d "
+           "(%.1Lf%% of the point estimate)\n",
+           domw,
+           100.0L * dom / (a[1] + b[1] > 0.0L ? (a[1] + b[1]) : 1.0L));
+  free(msg);
+  free(cw);
+  free(rv);
+  free(dec);
+  free(perm);
+  free(W);
+}
+/* independent end-to-end check for a plain binary code */
+static void dfr_sim_bincode(const BinCode *B, long double p, long N) {
+  int n = B->n, k = B->k;
+  uint8_t *msg = malloc((size_t)k), *cw = malloc((size_t)n),
+          *rv = malloc((size_t)n), *dec = malloc((size_t)n);
+  long fail = 0;
+  for (long tr = 0; tr < N; ++tr) {
+    for (int j = 0; j < k; ++j)
+      msg[j] = (uint8_t)(rnd() & 1);
+    bc_encode(B, msg, cw);
+    memcpy(rv, cw, (size_t)n);
+    dfr_bsc(rv, n, p);
+    int res = bc_decode(B, rv, NULL, dec);
+    if (res < 0 || memcmp(dec, cw, (size_t)n))
+      ++fail;
+  }
+  long double lo, hi;
+  dfr_wilson(fail, N, 3.0L, &lo, &hi);
+  printf("# simulation: %ld failures in %ld end-to-end trials = %.4Le  "
+         "[%.3Le, %.3Le] (Wilson, z=3)\n",
+         fail, N, (long double)fail / (long double)N, lo, hi);
+  free(msg);
+  free(cw);
+  free(rv);
+  free(dec);
+}
+/* independent end-to-end check for the concatenated code (same decoding
+ * chain as run_concat: inner failures become erasures) */
+static void dfr_sim_concat(GRS *G, const BinCode *In, long double p, long N) {
+  int no = G->n, ko = G->k, m = G->F->m, ni = In->n;
+  long Nb = (long)no * ni;
+  fe *msg = malloc(sizeof(fe) * (size_t)ko), *cw = malloc(sizeof(fe) * (size_t)no),
+     *rs = malloc(sizeof(fe) * (size_t)no), *os = malloc(sizeof(fe) * (size_t)no);
+  uint8_t *bits = malloc((size_t)Nb), *ib = malloc((size_t)In->k),
+          *era = calloc((size_t)no, 1), *dec = malloc((size_t)ni);
+  long fail = 0;
+  for (long tr = 0; tr < N; ++tr) {
+    for (int j = 0; j < ko; ++j)
+      msg[j] = (fe)(rnd() % (uint64_t)G->F->size);
+    grs_encode(G, msg, cw);
+    for (int i = 0; i < no; ++i) {
+      memset(ib, 0, (size_t)In->k);
+      for (int b = 0; b < m; ++b)
+        ib[b] = (uint8_t)((cw[i] >> b) & 1);
+      bc_encode(In, ib, bits + (long)i * ni);
+    }
+    dfr_bsc(bits, (int)Nb, p);
+    int nera = 0;
+    for (int i = 0; i < no; ++i) {
+      int c = bc_decode(In, bits + (long)i * ni, NULL, dec), ok = c >= 0;
+      fe sym = 0;
+      if (ok)
+        for (int j = 0; j < In->k; ++j) {
+          uint8_t v = dec[In->info[j]];
+          if (j < m)
+            sym |= (fe)(v << j);
+          else if (v)
+            ok = 0;
+        }
+      era[i] = !ok;
+      nera += !ok;
+      rs[i] = ok ? sym : 0;
+    }
+    int res = grs_decode(G, rs, nera ? era : NULL, os);
+    if (res < 0 || memcmp(os, cw, sizeof(fe) * (size_t)no))
+      ++fail;
+  }
+  long double lo, hi;
+  dfr_wilson(fail, N, 3.0L, &lo, &hi);
+  printf("# simulation: %ld failures in %ld end-to-end trials = %.4Le  "
+         "[%.3Le, %.3Le] (Wilson, z=3)\n",
+         fail, N, (long double)fail / (long double)N, lo, hi);
+  free(msg);
+  free(cw);
+  free(rs);
+  free(os);
+  free(bits);
+  free(ib);
+  free(era);
+  free(dec);
+}
+static void dfr_bincode(const BinCode *B, long double p, int T, long sim,
+                        int verbose) {
+  printf("# DFR on BSC(p = %.6Lg), block length n = %d\n", p, B->n);
+  if (B->kind == BC_ALT || B->kind == BC_GOPPA || B->kind == BC_GOLAY) {
+    long double v = dfr_tail(B->n, p, B->t);
+    printf("# method: exact. The decoder is a strict bounded-distance decoder "
+           "(correct iff the number of errors w <= t = %d), so\n", B->t);
+    printf("#         DFR = P(Bin(%d, p) > %d)\n", B->n, B->t);
+    dfr_print("DFR", v);
+  } else {
+    long double a[3], b[3], pr;
+    printf("# method: Monte Carlo at fixed weight w (%d trials per weight) "
+           "combined with Binomial(n,p)(w)%s\n",
+           T,
+           B->kind == BC_LDPC ? "" : "; weights w <= t are correct by design");
+    dfr_scan(B, 0, p, T, verbose, a, b, &pr);
+    dfr_print_range("DFR", a[0] + b[0], a[1] + b[1], a[2] + b[2]);
+    printf("# (bracket: Wilson z=4 per weight; neglected mass %.2Le is "
+           "included in the upper end)\n",
+           pr);
+  }
+  if (sim > 0)
+    dfr_sim_bincode(B, p, sim);
+}
+static void dfr_grs(int n, int k, int m, long double p, long sim) {
+  (void)sim;
+  long double q = 1.0L - powl(1.0L - p, (long double)m); /* symbol error */
+  printf("# DFR on BSC(p = %.6Lg): symbol error probability q = 1-(1-p)^%d = "
+         "%.6Le\n",
+         p, m, q);
+  printf("# method: exact, P(2E > n-k) = P(Bin(%d, q) > %d)\n", n, (n - k) / 2);
+  dfr_print("DFR", dfr_outer(n, n - k, 0.0L, q));
+}
+/* concat: outer code of length no with D = (max 2E+S it handles), inner code
+ * In carrying m message bits per symbol.  G != NULL enables --dfr-sim. */
+static void dfr_concat(const BinCode *In, int no, int D, int m, long double p,
+                       int T, long sim, GRS *G, int verbose) {
+  if (In->k < m)
+    die("inner code has k=%d < m=%d: choose an inner code with k >= m", In->k,
+        m);
+  long double a[3], b[3], pr;
+  printf("# DFR on BSC(p = %.6Lg); inner block n_in = %d, outer length %d, "
+         "outer decodes 2E+S <= %d\n",
+         p, In->n, no, D);
+  if (In->kind == BC_ALT || In->kind == BC_GOPPA || In->kind == BC_GOLAY)
+    printf("# inner blocks: P(w <= t=%d) is exact; weights above t measured "
+           "(%d trials each)\n",
+           In->t, T);
+  else
+    printf("# inner blocks measured by Monte Carlo at fixed weight (%d trials "
+           "per weight)\n",
+           T);
+  dfr_scan(In, m, p, T, verbose, a, b, &pr);
+  printf("# per inner block: correct %.6Lf, detected failure (erasure) "
+         "%.6Le, miscorrection (error) %.6Le\n",
+         1.0L - a[1] - b[1], a[1], b[1]);
+  long double lo = dfr_outer(no, D, a[0], b[0]);
+  long double pt = dfr_outer(no, D, a[1], b[1]);
+  long double hi = dfr_outer(no, D, a[2], b[2]);
+  dfr_print_range("DFR (errors and erasures)", lo, pt, hi);
+  dfr_print("DFR if every inner failure were a plain error (HQC-style, no "
+            "erasure information)",
+            dfr_outer(no, D, 0.0L, a[1] + b[1]));
+  printf("# (bracket: Wilson z=4 per weight; neglected inner mass %.2Le is "
+         "included in the upper end)\n",
+         pr);
+  if (sim > 0 && G)
+    dfr_sim_concat(G, In, p, sim);
+  else if (sim > 0)
+    printf("# --dfr-sim needs the built-in GRS outer code (not --dfr-outer)\n");
+}
+/* HQC noise e' = x*r2 - r1*y + e (x,y weight w; r1,r2 weight wr; e weight we)
+ * in the coordinate-independent model: one coordinate of a product of two
+ * sparse cyclic vectors is the parity of a hypergeometric overlap. */
+static long double dfr_hqc_p(int n, int w, int wr, int we) {
+  long double acc = -INFINITY;
+  for (int j = 1; j <= w && j <= wr; j += 2) {
+    if (wr - j > n - w)
+      continue;
+    acc = dfr_lse(acc, dfr_lbin(w, j) + dfr_lbin(n - w, wr - j) -
+                           dfr_lbin(n, wr));
+  }
+  long double po = acc == -INFINITY ? 0.0L : expl(acc);
+  long double pe = (long double)we / (long double)n;
+  return 0.5L * (1.0L - (1.0L - 2.0L * po) * (1.0L - 2.0L * po) *
+                            (1.0L - 2.0L * pe));
+}
+static long double dfr_parse_p(const char *s) {
+  if (!strncmp(s, "2^", 2))
+    return exp2l(strtold(s + 2, NULL));
+  return strtold(s, NULL);
+}
+
 /* ================= command line ================= */
 static void usage(void) {
   puts(
@@ -11697,6 +12261,9 @@ static void usage(void) {
       "  --b b           first zero beta^b of the BCH code   (default 1)\n"
       "  --ext           golay: extended [24,12,8] code\n"
       "  --errors e      injected errors (bits / symbols / rank / total bits)\n"
+      "  --compare SPEC,...  benchmark comma-separated binary code specs at a target rate\n"
+      "  --rate R            target rate k/n; --rate-tol X absolute tolerance (default 0.02)\n"
+      "  --seed N            reproducible benchmark seed (default 1)\n"
       "                  default: the guaranteed capability of the code\n"
       "  --erasures s    injected erasures (bch, alternant/Srivastava, rs, grs)\n"
       "  --input FILE    encode/decode data from a file (binary-code "
@@ -11730,6 +12297,17 @@ static void usage(void) {
       "  -shuffle        rs/grs: random order of evaluation points\n"
       "  -random-v       grs: explicit random-multiplier flag (GRS already defaults to it)\n"
       "  -n N            N random trials (summary only)       -v  every trial\n"
+      "  --dfr           decoding failure probability on a binary symmetric channel\n"
+      "                  (bch/alt/goppa/srivastava/gs/golay/rs/grs exact; rm/hadamard/ldpc\n"
+      "                  and the inner code of concat: Monte Carlo per error weight)\n"
+      "  --ber p         bit flip probability, e.g. 0.3 or 2^-8   (with --dfr)\n"
+      "  --hqc n:w:wr:we noise of HQC (x*r2 - r1*y + e) as a BSC, coordinate-independent model\n"
+      "  --dfr-trials N  Monte Carlo trials per error weight (first pass, default 1000)\n"
+      "  --dfr-prec x    refine until the bracket is within x of the estimate (default 0.3)\n"
+      "  --dfr-max N     at most N trials at one weight (default 200000)\n"
+      "  --dfr-sim N     cross-check by N end-to-end simulations (bch..., concat)\n"
+      "  --dfr-outer n:D concat: outer code of length n correcting 2E+S <= D (e.g. an AG\n"
+      "                  outer code: D = d-1); replaces the built-in RS outer code\n"
       "  -show-values    print vectors / error values\n"
       "  -list           only list the code parameters and exit\n"
       "examples:\n"
@@ -11949,6 +12527,13 @@ int codes_run(int argc, char **argv) {
       only_list = 0, iters = 8, ext = 0, shuffle = 0, randv = 0,
       rmr = 2, use_ecp = 0, dv = 3, dc = 6;
   const char *mode = "demo";
+  int dfr = 0, dfr_trials = 1000;
+  long dfr_sim = 0;
+  const char *ber_s = NULL, *hqc_s = NULL, *dfr_outer_s = NULL;
+  const char *compare_s = NULL;
+  double compare_rate = -1.0, compare_tol = 0.02;
+  unsigned compare_seed = 1;
+  long double dfr_p = 0.0L;
   unsigned poly = 0, seed = 1, ldpc_seed = 0;
   UcHdr uh;
   uint8_t *uc_buf = NULL;
@@ -11977,6 +12562,14 @@ int codes_run(int argc, char **argv) {
       b = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--errors") && i + 1 < argc)
       nerr = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--compare") && i + 1 < argc)
+      compare_s = argv[++i];
+    else if (!strcmp(argv[i], "--rate") && i + 1 < argc)
+      compare_rate = atof(argv[++i]);
+    else if (!strcmp(argv[i], "--rate-tol") && i + 1 < argc)
+      compare_tol = atof(argv[++i]);
+    else if (!strcmp(argv[i], "--seed") && i + 1 < argc)
+      compare_seed = (unsigned)strtoul(argv[++i], NULL, 10);
     else if (!strcmp(argv[i], "--mode") && i + 1 < argc)
       mode = argv[++i];
     else if (!strcmp(argv[i], "--dv") && i + 1 < argc)
@@ -12017,6 +12610,22 @@ int codes_run(int argc, char **argv) {
       iters = atoi(argv[++i]);
     else if (!strcmp(argv[i], "-n") && i + 1 < argc)
       trials = atoi(argv[++i]);
+    else if (flag(argv[i], "dfr"))
+      dfr = 1;
+    else if (!strcmp(argv[i], "--ber") && i + 1 < argc)
+      ber_s = argv[++i];
+    else if (!strcmp(argv[i], "--hqc") && i + 1 < argc)
+      hqc_s = argv[++i];
+    else if (!strcmp(argv[i], "--dfr-trials") && i + 1 < argc)
+      dfr_trials = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--dfr-sim") && i + 1 < argc)
+      dfr_sim = atol(argv[++i]);
+    else if (!strcmp(argv[i], "--dfr-prec") && i + 1 < argc)
+      g_dfr_prec = atof(argv[++i]);
+    else if (!strcmp(argv[i], "--dfr-max") && i + 1 < argc)
+      g_dfr_max = atol(argv[++i]);
+    else if (!strcmp(argv[i], "--dfr-outer") && i + 1 < argc)
+      dfr_outer_s = argv[++i];
     else if (flag(argv[i], "fht"))
       g_fht = 1;
     else if (flag(argv[i], "ext"))
@@ -12048,6 +12657,33 @@ int codes_run(int argc, char **argv) {
   }
   if (trials < 1)
     trials = 1;
+  if (dfr) {
+    if (dfr_trials < 1)
+      die("--dfr-trials must be >= 1");
+    if (g_dfr_max < dfr_trials)
+      g_dfr_max = dfr_trials;
+    if (!(g_dfr_prec > 0.0))
+      die("--dfr-prec must be > 0");
+    if (hqc_s) {
+      int hn, hw, hwr, hwe;
+      if (sscanf(hqc_s, "%d:%d:%d:%d", &hn, &hw, &hwr, &hwe) != 4 || hn < 2 ||
+          hw < 1 || hwr < 1 || hwe < 0 || hw > hn || hwr > hn || hwe > hn)
+        die("--hqc needs n:w:wr:we, e.g. 17669:66:75:75");
+      dfr_p = dfr_hqc_p(hn, hw, hwr, hwe);
+      printf("# HQC noise model (coordinate-independent): n=%d w=%d wr=%d we=%d "
+             "-> BSC p = %.6Lf\n",
+             hn, hw, hwr, hwe, dfr_p);
+    } else if (ber_s) {
+      dfr_p = dfr_parse_p(ber_s);
+    } else
+      die("--dfr needs --ber p (or --hqc n:w:wr:we)");
+    if (!(dfr_p > 0.0L && dfr_p < 1.0L))
+      die("the bit flip probability must satisfy 0 < p < 1");
+    if (!strcmp(mode, "demo") == 0 || input_path || output_path)
+      die("--dfr cannot be combined with --mode / --input / --output");
+    if (!strcmp(code, "product") || !strcmp(code, "rank"))
+      die("--dfr is not available for code '%s' yet", code);
+  }
   if (g_ldpc_iters < 1 || g_ldpc_norm <= 0.0 || g_ldpc_norm > 1.0)
     die("invalid --ldpc-iters / --ldpc-norm");
   int is_enc = !strcmp(mode, "encode"), is_dec = !strcmp(mode, "decode"),
@@ -12071,6 +12707,14 @@ int codes_run(int argc, char **argv) {
   rng_s ^= (uint64_t)seed * 0x9E3779B97F4A7C15ULL;
   for (int i = 0; i < 8; ++i)
     (void)rnd();
+  if (compare_s) {
+    if (compare_rate <= 0.0)
+      die("--compare requires --rate R");
+    if (input_path || output_path || strcmp(mode, "demo") || nera || dfr)
+      die("--compare cannot be combined with file mode, --erasures or --dfr");
+    return benchmark_rate(compare_s, compare_rate, compare_tol, trials,
+                          nerr, compare_seed, poly);
+  }
   if (is_noise) {
     if (nerr < 0) die("--mode noise needs --errors N (bit flips per block)");
     uc_buf = uc_read_file(input_path, &uc_size);
@@ -12137,6 +12781,10 @@ int codes_run(int argc, char **argv) {
              B->k, B->t, B->kind == BC_ALT ? " (+ erasures: 2e+s <= r)" : "");
     if (only_list)
       return 0;
+    if (dfr) {
+      dfr_bincode(B, dfr_p, dfr_trials, dfr_sim, verbose);
+      return 0;
+    }
     if (is_enc) {
       snprintf(uh.code, sizeof uh.code, "%s", code);
       uh.f[UC_M] = (uint32_t)m; uh.f[UC_POLY] = poly; uh.f[UC_LEN] = (uint32_t)len;
@@ -12190,6 +12838,10 @@ int codes_run(int argc, char **argv) {
            use_randv ? "GRS" : "RS", n, kk, n - kk + 1, mm, n - kk);
     if (only_list)
       return 0;
+    if (dfr) {
+      dfr_grs(n, kk, mm, dfr_p, dfr_sim);
+      return 0;
+    }
     run_grs(G, trials, nerr, nera, verbose, showv, use_ecp);
     return 0;
   }
@@ -12229,6 +12881,17 @@ int codes_run(int argc, char **argv) {
     GF *F = gf_new(mm, poly);
     BinCode *In = bc_parse(inner, poly);
     int no = len > 0 ? len : 100, ko = k > 0 ? k : no * 3 / 5;
+    if (dfr && dfr_outer_s) {
+      int on = 0, oD = 0;
+      if (sscanf(dfr_outer_s, "%d:%d", &on, &oD) != 2 || on < 1 || oD < 0 ||
+          oD > on)
+        die("--dfr-outer needs n:D with 0 <= D <= n, e.g. 1009:500");
+      printf("# concatenated code: outer (length %d, handles 2E+S <= %d, GF(2^%d) "
+             "symbols)  o  inner %s (k_in=%d)\n",
+             on, oD, mm, In->name, In->k);
+      dfr_concat(In, on, oD, mm, dfr_p, dfr_trials, 0, NULL, verbose);
+      return 0;
+    }
     GRS *G = grs_new(F, no, ko, shuffle, randv);
     if (nerr < 0)
       nerr = In->t * ((no - ko) / 2 + 1);
@@ -12239,6 +12902,10 @@ int codes_run(int argc, char **argv) {
            ko * mm, (no - ko + 1) * In->dmin);
     if (only_list)
       return 0;
+    if (dfr) {
+      dfr_concat(In, no, no - ko, mm, dfr_p, dfr_trials, dfr_sim, G, verbose);
+      return 0;
+    }
     run_concat(G, In, trials, nerr, verbose, showv);
     return 0;
   }
@@ -12278,6 +12945,8 @@ static void unified_usage(void) {
       "  --code SPEC ...           Selects the classical family automatically");
   puts("  --code rm --r 1 --m 8 -fht   RM(1,8), fast Walsh-Hadamard decoding");
   puts("  --code rm --r 2 --m 8        RM(2,8), majority decoding");
+  puts("  --code concat ... --dfr --ber p   decoding failure probability (HQC-style:");
+  puts("                            inner block failure x exact outer RS tail, log domain)");
   puts("\nBUILD");
   puts("  cc -O2 -std=gnu11 -fopenmp -Wall -Wextra unified_codes.c -lm -o "
        "unified_codes");
