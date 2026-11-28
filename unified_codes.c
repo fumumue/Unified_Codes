@@ -9552,7 +9552,8 @@ typedef enum {
   BC_GOLAY = 2,
   BC_RM = 3,
   BC_HAD = 4,
-  BC_LDPC = 5
+  BC_LDPC = 5,
+  BC_DUP = 6
 } BcKind;
 typedef struct {
   char name[128];
@@ -9562,6 +9563,7 @@ typedef struct {
   AltCode *alt;
   uint32_t *gtab;
   int rm_r, rm_m;
+  int dup_count; /* number of identical RM(1,7) copies */
   unsigned *mon; /* RM: monomial x_S (bit mask S), degree <= r */
   uint8_t *gsys; /* RM: systematic generator, k rows of n bytes */
   LdpcCode *ldpc; /* LDPC: Tanner graph, reduced H, decoder scratch */
@@ -9699,6 +9701,29 @@ static BinCode *bc_rm(int r, int m) {
   B->gsys = G;
   return B;
 }
+/* Duplicate one RM(1,7) codeword several times (HQC-style dRM). */
+static BinCode *bc_drm(int copies) {
+  if (copies < 2 || copies > 16)
+    die("dRM repetition count must be between 2 and 16");
+  BinCode *B = bc_rm(1, 7);
+  const int base_n = B->n;
+  uint8_t *G = malloc((size_t)B->k * (size_t)base_n * (size_t)copies);
+  if (!G) die("out of memory");
+  for (int u = 0; u < B->k; ++u)
+    for (int c = 0; c < copies; ++c)
+      memcpy(G + (size_t)u * (base_n * copies) + (size_t)c * base_n,
+             B->gsys + (size_t)u * base_n, (size_t)base_n);
+  free(B->gsys);
+  B->gsys = G;
+  B->kind = BC_DUP;
+  B->dup_count = copies;
+  B->n = base_n * copies;
+  B->dmin *= copies;
+  B->t = (B->dmin - 1) / 2;
+  snprintf(B->name, sizeof B->name, "dRM(1,7)x%d[%d,%d,%d]",
+           copies, B->n, B->k, B->dmin);
+  return B;
+}
 /* Reed majority-logic decoding: for d = r..0 every coefficient a_S, |S| = d,
  * is the majority of the 2^(m-d) disjoint check sums  sum_{x_S free} w(x)
  * (the other coordinates fixed); decoded degree-d terms are then removed. */
@@ -9789,6 +9814,37 @@ static int fht_decode(const BinCode *B, const uint8_t *rcv, uint8_t *out,
   free(F);
   return ties > 1 ? -1 : cnt;
 }
+/* Soft-combine repeated copies, then ML-decode RM(1,7) with a 128-point
+ * Walsh-Hadamard transform. */
+static int drm_fht_decode(const BinCode *B, const uint8_t *rcv,
+                          uint8_t *out) {
+  const int base_n = 128;
+  int *F = malloc(sizeof(int) * base_n);
+  if (!F) return -1;
+  for (int x = 0; x < base_n; ++x) {
+    int sum = 0;
+    for (int c = 0; c < B->dup_count; ++c)
+      sum += (rcv[(size_t)c * base_n + x] & 1) ? -1 : 1;
+    F[x] = sum;
+  }
+  fwht(F, base_n);
+  int best = -1, bv = -1, ties = 0;
+  for (int a = 0; a < base_n; ++a) {
+    int v = abs(F[a]);
+    if (v > bv) { bv = v; best = a; ties = 1; }
+    else if (v == bv) ++ties;
+  }
+  int a0 = F[best] < 0;
+  int dist = 0;
+  for (int c = 0; c < B->dup_count; ++c)
+    for (int x = 0; x < base_n; ++x) {
+      uint8_t bit = (uint8_t)((__builtin_popcount((unsigned)(best & x)) & 1) ^ a0);
+      out[(size_t)c * base_n + x] = bit;
+      dist += bit != (rcv[(size_t)c * base_n + x] & 1);
+    }
+  free(F);
+  return ties > 1 ? -1 : dist;
+}
 static BinCode *bc_had(int m) {
   if (m < 2 || m > MAXM)
     die("Hadamard code needs 2 <= m <= %d", MAXM);
@@ -9824,7 +9880,7 @@ static void bc_encode(const BinCode *B, const uint8_t *msg, uint8_t *cw) {
       a |= (unsigned)(msg[j] & 1) << j;
     for (int x = 0; x < B->n; ++x)
       cw[x] = (uint8_t)(__builtin_popcount(a & (unsigned)x) & 1);
-  } else if (B->kind == BC_RM) {
+  } else if (B->kind == BC_RM || B->kind == BC_DUP) {
     memset(cw, 0, (size_t)B->n);
     for (int u = 0; u < B->k; ++u)
       if (msg[u])
@@ -9865,6 +9921,8 @@ static int bc_decode(const BinCode *B, const uint8_t *rcv, const uint8_t *era,
   }
   if (B->kind == BC_HAD)
     return fht_decode(B, rcv, out, 0);
+  if (B->kind == BC_DUP)
+    return drm_fht_decode(B, rcv, out);
   if (B->kind == BC_RM)
     return (g_fht && B->rm_r == 1) ? fht_decode(B, rcv, out, 1)
                                    : rm_decode(B, rcv, out);
@@ -9902,6 +9960,8 @@ static BinCode *bc_parse(const char *spec, unsigned poly) {
                           : ((uint32_t)(rnd() >> 16) | 1u));
   if (!strcmp(tok[0], "rm") && nt >= 3)
     return bc_rm(v[1], v[2]);
+  if (!strcmp(tok[0], "drm") && nt >= 2)
+    return bc_drm(v[1]);
   if (!strcmp(tok[0], "bch") && nt >= 3) {
     int n = nt > 3 ? v[3] : 0, b = nt > 4 ? v[4] : 1;
     AltCode *A = make_bch(v[1], poly, v[2], n, b);
@@ -9942,7 +10002,7 @@ static BinCode *bc_parse(const char *spec, unsigned poly) {
     return B;
   }
   die("bad code spec '%s' (bch:m:t[:n[:b]] | golay | golay24 | goppa:m:t[:n] | "
-      "alt:m:n:t | srivastava:m:s[:n[:mu]] | gs:m:s:t[:n] | rm:r:m | had:m | "
+      "alt:m:n:t | srivastava:m:s[:n[:mu]] | gs:m:s:t[:n] | rm:r:m | drm:copies | had:m | "
       "ldpc:n:dv:dc[:t[:seed]])",
       spec);
   return NULL;
@@ -10036,6 +10096,144 @@ static int benchmark_rate(const char *specs, double target, double tol,
   if (!tested)
     fprintf(stderr, "no candidate matched the requested rate window\n");
   return tested ? 0 : 1;
+}
+
+/* ================= automatic exact same-rate search =================
+ * Enumerate bounded RM/dRM/BCH parameter sets, group by exact k/n using
+ * cross multiplication, then benchmark every candidate at the selected rate.
+ * If --errors is omitted, use the smallest guaranteed correction capability
+ * among the selected candidates so every code receives the same error load. */
+typedef struct {
+  char spec[64];
+  int n, k, t, family; /* 0=dRM, 1=RM, 2=BCH */
+} AutoRateCand;
+
+static int auto_rate_equal(const AutoRateCand *a, const AutoRateCand *b) {
+  return (int64_t)a->k * b->n == (int64_t)b->k * a->n;
+}
+
+static int auto_add_candidate(AutoRateCand *v, int *nv, int cap,
+                              const char *spec, int family, unsigned poly) {
+  if (*nv >= cap) return -1;
+  BinCode *B = bc_parse(spec, poly);
+  AutoRateCand *c = &v[(*nv)++];
+  snprintf(c->spec, sizeof c->spec, "%s", spec);
+  c->n = B->n; c->k = B->k; c->t = B->t; c->family = family;
+  bc_free(B);
+  return 0;
+}
+
+static int auto_same_rate(const char *families, double target, double tol,
+                          int trials, int fixed_errors, uint64_t seed,
+                          unsigned poly) {
+  enum { AUTO_CAP = 512 };
+  AutoRateCand cand[AUTO_CAP];
+  int nc = 0, want[3] = {0, 0, 0};
+  char fbuf[128];
+  if (!families || !*families || strlen(families) >= sizeof fbuf) {
+    fprintf(stderr, "--auto-same-rate needs a family list: drm,rm,bch\n");
+    return 2;
+  }
+  snprintf(fbuf, sizeof fbuf, "%s", families);
+  for (char *q = strtok(fbuf, ","); q; q = strtok(NULL, ",")) {
+    while (*q == ' ' || *q == '\t') ++q;
+    char *e = q + strlen(q);
+    while (e > q && (e[-1] == ' ' || e[-1] == '\t')) *--e = '\0';
+    if (!strcmp(q, "drm")) want[0] = 1;
+    else if (!strcmp(q, "rm")) want[1] = 1;
+    else if (!strcmp(q, "bch")) want[2] = 1;
+    else {
+      fprintf(stderr, "unsupported auto-search family '%s' (use drm,rm,bch)\n", q);
+      return 2;
+    }
+  }
+  if (want[0] + want[1] + want[2] < 2) {
+    fprintf(stderr, "--auto-same-rate needs at least two distinct families\n");
+    return 2;
+  }
+  int requested_families = want[0] + want[1] + want[2];
+  uint64_t saved_rng = rng_s;
+  uint64_t base_rng = saved_rng ^ (seed * 0x9E3779B97F4A7C15ULL);
+  char spec[64];
+  if (want[0]) for (int c = 2; c <= 16; ++c) {
+    snprintf(spec, sizeof spec, "drm:%d", c);
+    rng_s = base_rng;
+    if (auto_add_candidate(cand, &nc, AUTO_CAP, spec, 0, poly)) goto oom;
+  }
+  if (want[1]) for (int m = 2; m <= MAXM; ++m)
+    for (int r = 0; r < m; ++r) {
+      snprintf(spec, sizeof spec, "rm:%d:%d", r, m);
+      rng_s = base_rng;
+      if (auto_add_candidate(cand, &nc, AUTO_CAP, spec, 1, poly)) goto oom;
+    }
+  if (want[2]) for (int m = 3; m <= MAXM; ++m) {
+    int n = (1 << m) - 1;
+    int tmax = (n - 1) / 2;
+    if (tmax > 32) tmax = 32; /* bounded search; keeps enumeration practical */
+    for (int t = 1; t <= tmax; ++t) {
+      snprintf(spec, sizeof spec, "bch:%d:%d", m, t);
+      rng_s = base_rng;
+      if (auto_add_candidate(cand, &nc, AUTO_CAP, spec, 2, poly)) goto oom;
+    }
+  }
+  rng_s = saved_rng;
+  if (nc == 0) {
+    fprintf(stderr, "auto-search generated no candidates\n");
+    return 1;
+  }
+
+  int best = -1, best_coverage = 0;
+  double best_delta = 1e300, best_rate = 0.0;
+  for (int i = 0; i < nc; ++i) {
+    int seen[3] = {0, 0, 0};
+    for (int j = 0; j < nc; ++j)
+      if (auto_rate_equal(&cand[i], &cand[j])) seen[cand[j].family] = 1;
+    int coverage = seen[0] + seen[1] + seen[2];
+    if (coverage < 2) continue;
+    double rate = (double)cand[i].k / cand[i].n;
+    double delta = target > 0.0 ? fabs(rate - target) : 0.0;
+    if (target > 0.0 && delta > tol) continue;
+    if (coverage > best_coverage ||
+        (coverage == best_coverage && target > 0.0 && delta < best_delta) ||
+        (coverage == best_coverage && (target <= 0.0 || delta == best_delta) && rate > best_rate)) {
+      best = i; best_coverage = coverage; best_delta = delta; best_rate = rate;
+    }
+  }
+  if (best < 0) {
+    fprintf(stderr, "no exact common rate found for requested families\n");
+    return 1;
+  }
+
+  int min_t = INT32_MAX, selected = 0;
+  size_t listcap = 1, used = 0;
+  for (int i = 0; i < nc; ++i) if (auto_rate_equal(&cand[best], &cand[i])) {
+    listcap += strlen(cand[i].spec) + 1;
+    if (cand[i].t < min_t) min_t = cand[i].t;
+    ++selected;
+  }
+  char *list = malloc(listcap);
+  if (!list) goto oom;
+  list[0] = '\0';
+  for (int i = 0; i < nc; ++i) if (auto_rate_equal(&cand[best], &cand[i])) {
+    if (used) list[used++] = ',';
+    size_t z = strlen(cand[i].spec);
+    memcpy(list + used, cand[i].spec, z); used += z; list[used] = '\0';
+  }
+  int errors = fixed_errors >= 0 ? fixed_errors : min_t;
+  printf("# auto same-rate search: families=%s candidates=%d selected=%d\n",
+         families, nc, selected);
+  printf("# exact common rate = %d/%d = %.9f; family coverage=%d/%d\n",
+         cand[best].k, cand[best].n, best_rate, best_coverage, requested_families);
+  printf("# common error load = %d bit(s) per block%s\n", errors,
+         fixed_errors >= 0 ? " (user-specified)" : " (minimum guaranteed capability)");
+  int rc = benchmark_rate(list, best_rate, 0.0, trials, errors, seed, poly);
+  free(list);
+  return rc;
+
+oom:
+  rng_s = saved_rng;
+  fprintf(stderr, "out of memory or too many auto-search candidates\n");
+  return 2;
 }
 
 /* ================= GRS ================= */
@@ -12261,7 +12459,8 @@ static void usage(void) {
       "  --b b           first zero beta^b of the BCH code   (default 1)\n"
       "  --ext           golay: extended [24,12,8] code\n"
       "  --errors e      injected errors (bits / symbols / rank / total bits)\n"
-      "  --compare SPEC,...  benchmark comma-separated binary code specs at a target rate\n"
+      "  --compare SPEC,...  benchmark explicit binary code specs at a target rate\n"
+      "  --auto-same-rate FAMILIES  search exact common rates (families: drm,rm,bch)\n"
       "  --rate R            target rate k/n; --rate-tol X absolute tolerance (default 0.02)\n"
       "  --seed N            reproducible benchmark seed (default 1)\n"
       "                  default: the guaranteed capability of the code\n"
@@ -12287,7 +12486,7 @@ static void usage(void) {
       "  --inner spec    concat: inner binary code             (default "
       "golay)\n"
       "        specs:  bch:m:t[:n[:b]]  golay  golay24  goppa:m:t[:n]  "
-      "alt:m:n:t  srivastava:m:s[:n[:mu]]  gs:m:s:t[:n]  rm:r:m  had:m  ldpc:n:dv:dc[:t[:seed]]\n"
+      "alt:m:n:t  srivastava:m:s[:n[:mu]]  gs:m:s:t[:n]  rm:r:m  drm:copies  had:m  ldpc:n:dv:dc[:t[:seed]]\n"
       "  -eea            alternant/Srivastava: extended-Euclid decoder (no erasures)\n"
       "  (default alternant/Srivastava decoder: Berlekamp-Massey)\n"
       "  --iters N       product: maximal row/column sweeps  (default 8)\n"
@@ -12530,7 +12729,7 @@ int codes_run(int argc, char **argv) {
   int dfr = 0, dfr_trials = 1000;
   long dfr_sim = 0;
   const char *ber_s = NULL, *hqc_s = NULL, *dfr_outer_s = NULL;
-  const char *compare_s = NULL;
+  const char *compare_s = NULL, *auto_same_rate_s = NULL;
   double compare_rate = -1.0, compare_tol = 0.02;
   unsigned compare_seed = 1;
   long double dfr_p = 0.0L;
@@ -12564,6 +12763,8 @@ int codes_run(int argc, char **argv) {
       nerr = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--compare") && i + 1 < argc)
       compare_s = argv[++i];
+    else if (!strcmp(argv[i], "--auto-same-rate") && i + 1 < argc)
+      auto_same_rate_s = argv[++i];
     else if (!strcmp(argv[i], "--rate") && i + 1 < argc)
       compare_rate = atof(argv[++i]);
     else if (!strcmp(argv[i], "--rate-tol") && i + 1 < argc)
@@ -12707,6 +12908,15 @@ int codes_run(int argc, char **argv) {
   rng_s ^= (uint64_t)seed * 0x9E3779B97F4A7C15ULL;
   for (int i = 0; i < 8; ++i)
     (void)rnd();
+  if (auto_same_rate_s) {
+    if (compare_s) die("--auto-same-rate cannot be combined with --compare");
+    if (input_path || output_path || strcmp(mode, "demo") || nera || dfr)
+      die("--auto-same-rate cannot be combined with file mode, --erasures or --dfr");
+    if (compare_rate > 0.0 && (compare_tol < 0.0 || compare_tol > 1.0))
+      die("--rate-tol must be between 0 and 1");
+    return auto_same_rate(auto_same_rate_s, compare_rate, compare_tol, trials,
+                          nerr, compare_seed, poly);
+  }
   if (compare_s) {
     if (compare_rate <= 0.0)
       die("--compare requires --rate R");
