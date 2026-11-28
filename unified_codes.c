@@ -10013,11 +10013,12 @@ static BinCode *bc_parse(const char *spec, unsigned poly) {
  * Compare binary code families supported by bc_parse().  Each candidate is
  * tested with the same PRNG initial state; timings are per block. */
 static int benchmark_rate(const char *specs, double target, double tol,
-                          int trials, int fixed_errors, uint64_t seed,
-                          unsigned poly) {
+                          int trials, int fixed_errors, double error_rate,
+                          uint64_t seed, unsigned poly) {
   if (!specs || !*specs || !(target > 0.0 && target <= 1.0) ||
-      tol < 0.0 || trials < 1) {
-    fprintf(stderr, "invalid --compare / --rate / --rate-tol / -n value\n");
+      tol < 0.0 || trials < 1 ||
+      (error_rate >= 0.0 && error_rate > 1.0)) {
+    fprintf(stderr, "invalid --compare / --rate / --rate-tol / --error-rate / -n value\n");
     return 2;
   }
   char *list = strdup(specs);
@@ -10026,7 +10027,7 @@ static int benchmark_rate(const char *specs, double target, double tol,
   uint64_t base_rng = saved_rng ^ (seed * 0x9E3779B97F4A7C15ULL);
   printf("# same-rate benchmark: target=%.6f tolerance=%.6f trials=%d\n",
          target, tol, trials);
-  printf("# spec | code | n | k | rate | enc_ms/block | dec_ms/block | failures | fail_rate\n");
+  printf("# spec | code | n | k | rate | errors/block | enc_ms/block | dec_ms/block | failures | fail_rate\n");
   int tested = 0;
   char *p = list;
   while (*p) {
@@ -10043,7 +10044,9 @@ static int benchmark_rate(const char *specs, double target, double tol,
         printf("# skip %s: rate %.6f outside [%.6f, %.6f]\n",
                p, rate, target - tol, target + tol);
       } else {
-        int errors = fixed_errors >= 0 ? fixed_errors : B->t;
+        int errors = error_rate >= 0.0
+                         ? (int)floor(error_rate * B->n + 0.5)
+                         : (fixed_errors >= 0 ? fixed_errors : B->t);
         if (errors < 0 || errors > B->n) {
           fprintf(stderr, "invalid error count %d for %s (n=%d)\n",
                   errors, p, B->n);
@@ -10079,8 +10082,8 @@ static int benchmark_rate(const char *specs, double target, double tol,
             ++failures;
         }
         rng_s = trial_rng;
-        printf("%s | %s | %d | %d | %.6f | %.6f | %.6f | %d/%d | %.6f\n",
-               p, B->name, B->n, B->k, rate,
+        printf("%s | %s | %d | %d | %.6f | %d | %.6f | %.6f | %d/%d | %.6f\n",
+               p, B->name, B->n, B->k, rate, errors,
                1000.0 * enc_total / trials, 1000.0 * dec_total / trials,
                failures, trials, (double)failures / trials);
         ++tested;
@@ -10124,8 +10127,8 @@ static int auto_add_candidate(AutoRateCand *v, int *nv, int cap,
 }
 
 static int auto_same_rate(const char *families, double target, double tol,
-                          int trials, int fixed_errors, uint64_t seed,
-                          unsigned poly) {
+                          int trials, int fixed_errors, double error_rate,
+                          uint64_t seed, unsigned poly) {
   enum { AUTO_CAP = 512 };
   AutoRateCand cand[AUTO_CAP];
   int nc = 0, want[3] = {0, 0, 0};
@@ -10224,9 +10227,12 @@ static int auto_same_rate(const char *families, double target, double tol,
          families, nc, selected);
   printf("# exact common rate = %d/%d = %.9f; family coverage=%d/%d\n",
          cand[best].k, cand[best].n, best_rate, best_coverage, requested_families);
-  printf("# common error load = %d bit(s) per block%s\n", errors,
-         fixed_errors >= 0 ? " (user-specified)" : " (minimum guaranteed capability)");
-  int rc = benchmark_rate(list, best_rate, 0.0, trials, errors, seed, poly);
+  if (error_rate >= 0.0)
+    printf("# common error rate = %.6f (rounded to nearest integer per block)\n", error_rate);
+  else
+    printf("# common error load = %d bit(s) per block%s\n", errors,
+           fixed_errors >= 0 ? " (user-specified)" : " (minimum guaranteed capability)");
+  int rc = benchmark_rate(list, best_rate, 0.0, trials, errors, error_rate, seed, poly);
   free(list);
   return rc;
 
@@ -12459,6 +12465,7 @@ static void usage(void) {
       "  --b b           first zero beta^b of the BCH code   (default 1)\n"
       "  --ext           golay: extended [24,12,8] code\n"
       "  --errors e      injected errors (bits / symbols / rank / total bits)\n"
+      "  --error-rate p  bit error fraction (0..1; compare/auto-same-rate only)\n"
       "  --compare SPEC,...  benchmark explicit binary code specs at a target rate\n"
       "  --auto-same-rate FAMILIES  search exact common rates (families: drm,rm,bch)\n"
       "  --rate R            target rate k/n; --rate-tol X absolute tolerance (default 0.02)\n"
@@ -12730,7 +12737,8 @@ int codes_run(int argc, char **argv) {
   long dfr_sim = 0;
   const char *ber_s = NULL, *hqc_s = NULL, *dfr_outer_s = NULL;
   const char *compare_s = NULL, *auto_same_rate_s = NULL;
-  double compare_rate = -1.0, compare_tol = 0.02;
+  double compare_rate = -1.0, compare_tol = 0.02, error_rate = -1.0;
+  int errors_explicit = 0, error_rate_set = 0;
   unsigned compare_seed = 1;
   long double dfr_p = 0.0L;
   unsigned poly = 0, seed = 1, ldpc_seed = 0;
@@ -12759,8 +12767,13 @@ int codes_run(int argc, char **argv) {
       rmr = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--b") && i + 1 < argc)
       b = atoi(argv[++i]);
-    else if (!strcmp(argv[i], "--errors") && i + 1 < argc)
+    else if (!strcmp(argv[i], "--errors") && i + 1 < argc) {
       nerr = atoi(argv[++i]);
+      errors_explicit = 1;
+    } else if (!strcmp(argv[i], "--error-rate") && i + 1 < argc) {
+      error_rate = strtod(argv[++i], NULL);
+      error_rate_set = 1;
+    }
     else if (!strcmp(argv[i], "--compare") && i + 1 < argc)
       compare_s = argv[++i];
     else if (!strcmp(argv[i], "--auto-same-rate") && i + 1 < argc)
@@ -12799,6 +12812,7 @@ int codes_run(int argc, char **argv) {
     else if (!strcmp(argv[i], "--no-errors")) {
       no_errors = 1;
       nerr = 0;
+      errors_explicit = 1;
     } else if (!strcmp(argv[i], "--erasures") && i + 1 < argc)
       nera = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--c1") && i + 1 < argc)
@@ -12858,6 +12872,10 @@ int codes_run(int argc, char **argv) {
   }
   if (trials < 1)
     trials = 1;
+  if (error_rate_set && (!isfinite(error_rate) || error_rate < 0.0 || error_rate > 1.0))
+    die("--error-rate must be between 0 and 1");
+  if (error_rate_set && errors_explicit)
+    die("use either --errors or --error-rate, not both");
   if (dfr) {
     if (dfr_trials < 1)
       die("--dfr-trials must be >= 1");
@@ -12915,7 +12933,7 @@ int codes_run(int argc, char **argv) {
     if (compare_rate > 0.0 && (compare_tol < 0.0 || compare_tol > 1.0))
       die("--rate-tol must be between 0 and 1");
     return auto_same_rate(auto_same_rate_s, compare_rate, compare_tol, trials,
-                          nerr, compare_seed, poly);
+                          nerr, error_rate, compare_seed, poly);
   }
   if (compare_s) {
     if (compare_rate <= 0.0)
@@ -12923,8 +12941,10 @@ int codes_run(int argc, char **argv) {
     if (input_path || output_path || strcmp(mode, "demo") || nera || dfr)
       die("--compare cannot be combined with file mode, --erasures or --dfr");
     return benchmark_rate(compare_s, compare_rate, compare_tol, trials,
-                          nerr, compare_seed, poly);
+                          nerr, error_rate, compare_seed, poly);
   }
+  if (error_rate >= 0.0)
+    die("--error-rate is currently supported only with --compare or --auto-same-rate");
   if (is_noise) {
     if (nerr < 0) die("--mode noise needs --errors N (bit flips per block)");
     uc_buf = uc_read_file(input_path, &uc_size);
