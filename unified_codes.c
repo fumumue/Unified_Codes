@@ -14,6 +14,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include <ctype.h>
 #include <errno.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8391,6 +8392,9 @@ int noize_decode(int argc, char **argv, const uint16_t *received,
  *   srivastava  original Srivastava alternant (multiplicity 1, z_i=alpha_i^mu)
  *   gs       generalized Srivastava alternant, with s poles and multiplicity t
  *            (designed distance >= s*t+1); BM by default, generic EEA via -eea
+ *   ldpc     regular LDPC code (n, dv, dc, seed), systematic encoding, soft
+ *            sum-product / normalized min-sum belief-propagation decoding
+ *            (also usable as the inner code of product/concat)
  *   rm       binary Reed-Muller code RM(r,m) = [2^m, sum_{i<=r} C(m,i),
  *            2^(m-r)], Reed majority-logic decoding (corrects 2^(m-r-1)-1)
  *   hadamard Hadamard code [2^m, m, 2^(m-1)]; with -fht also RM(1,m): maximum-
@@ -9325,6 +9329,219 @@ static uint32_t *golay_table(void) {
   return tab;
 }
 
+/* ================= regular LDPC code (Gallager type, soft BP decoder) ======
+ * The parity-check matrix is built from a seed with a private splitmix64
+ * stream, so the same (n, dv, dc, seed) always gives the same code.  Encoding
+ * is systematic on the free columns of the reduced H; decoding is
+ * sum-product or normalized min-sum belief propagation on the Tanner graph
+ * of the original sparse H.  A bit-flip channel is fed in as LLR = +-4,
+ * erasures as LLR = 0.  There is no guaranteed t: "t" below is nominal. */
+#define LDPC_CLAMP 50.0
+typedef struct {
+  int n, m, dv, dc, k, rank;
+  uint32_t seed;
+  uint8_t *H;     /* m x n; reduced row-echelon form (used for encoding) */
+  int *edge_var;  /* m*dc: variable of edge (check c, slot j) = c*dc+j   */
+  int *var_edges; /* n*dv: edge ids of each variable                     */
+  int *pivot_col, *free_col;
+  uint8_t *is_pivot;
+  double *llr, *q, *rmsg, *tv, *pre, *suf; /* decoder scratch */
+} LdpcCode;
+static int g_ldpc_iters = 50, g_ldpc_minsum = 0;
+static double g_ldpc_norm = 0.8;
+
+static uint64_t ldpc_next(uint64_t *st) {
+  uint64_t z = (*st += 0x9E3779B97F4A7C15ULL);
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+  return z ^ (z >> 31);
+}
+static void ldpc_free(LdpcCode *g) {
+  if (!g) return;
+  free(g->H); free(g->edge_var); free(g->var_edges); free(g->pivot_col);
+  free(g->free_col); free(g->is_pivot); free(g->llr); free(g->q);
+  free(g->rmsg); free(g->tv); free(g->pre); free(g->suf);
+  free(g);
+}
+/* true if two columns of the sparse H coincide (a weight-2 codeword) */
+static int ldpc_has_equal_columns(const LdpcCode *g) {
+  int n = g->n, dv = g->dv;
+  size_t sz = 1;
+  while (sz < (size_t)2 * (size_t)n) sz <<= 1;
+  int *slot = malloc(sz * sizeof(int)), *key = malloc((size_t)n * (size_t)dv * sizeof(int));
+  if (!slot || !key) die("out of memory (ldpc)");
+  for (size_t i = 0; i < sz; ++i) slot[i] = -1;
+  int dup = 0;
+  for (int v = 0; v < n && !dup; ++v) {
+    int *kv = key + (size_t)v * (size_t)dv;
+    for (int j = 0; j < dv; ++j) kv[j] = g->var_edges[v * dv + j] / g->dc;
+    for (int a = 1; a < dv; ++a) {
+      int x = kv[a], b = a - 1;
+      while (b >= 0 && kv[b] > x) { kv[b + 1] = kv[b]; --b; }
+      kv[b + 1] = x;
+    }
+    uint64_t h = 1469598103934665603ULL;
+    for (int j = 0; j < dv; ++j) h = (h ^ (uint64_t)kv[j]) * 1099511628211ULL;
+    size_t pos = (size_t)(h ^ (h >> 29)) & (sz - 1);
+    while (slot[pos] >= 0) {
+      const int *ku = key + (size_t)slot[pos] * (size_t)dv;
+      int same = 1;
+      for (int j = 0; j < dv; ++j) if (ku[j] != kv[j]) { same = 0; break; }
+      if (same) { dup = 1; break; }
+      pos = (pos + 1) & (sz - 1);
+    }
+    if (!dup) slot[pos] = v;
+  }
+  free(slot); free(key);
+  return dup;
+}
+static LdpcCode *ldpc_new(int n, int dv, int dc, uint32_t seed) {
+  if (n <= 0 || dv < 1 || dc < 2 || dv >= n || dc > n || ((long long)n * dv) % dc)
+    die("invalid regular LDPC parameters (need dc>=2, dv<n, dc<=n, dc | n*dv)");
+  LdpcCode *g = calloc(1, sizeof *g);
+  if (!g) die("out of memory (ldpc)");
+  g->n = n; g->dv = dv; g->dc = dc; g->m = (int)((long long)n * dv / dc); g->seed = seed;
+  if ((double)g->m * (double)n > 4e9) die("LDPC matrix too large (m*n > 4e9)");
+  size_t E = (size_t)g->m * (size_t)dc;
+  g->H = calloc((size_t)g->m * (size_t)n, 1);
+  g->edge_var = malloc(E * sizeof(int));
+  g->var_edges = malloc((size_t)n * (size_t)dv * sizeof(int));
+  g->pivot_col = malloc((size_t)g->m * sizeof(int));
+  g->free_col = malloc((size_t)n * sizeof(int));
+  g->is_pivot = calloc((size_t)n, 1);
+  g->llr = malloc((size_t)n * sizeof(double));
+  g->q = malloc(E * sizeof(double));
+  g->rmsg = malloc(E * sizeof(double));
+  g->tv = malloc(((size_t)dc + 1) * sizeof(double));
+  g->pre = malloc(((size_t)dc + 1) * sizeof(double));
+  g->suf = malloc(((size_t)dc + 1) * sizeof(double));
+  int *perm = malloc((size_t)n * sizeof(int)), *vcount = calloc((size_t)n, sizeof(int));
+  if (!g->H || !g->edge_var || !g->var_edges || !g->pivot_col || !g->free_col ||
+      !g->is_pivot || !g->llr || !g->q || !g->rmsg || !g->tv || !g->pre ||
+      !g->suf || !perm || !vcount)
+    die("out of memory (ldpc)");
+  uint64_t st = (uint64_t)seed * 0x2545F4914F6CDD1DULL + 12345;
+  /* Regenerate (continuing the same seeded stream, so it stays reproducible)
+     while two columns of H coincide: that is a weight-2 codeword, and not
+     even a single bit error could then be corrected reliably. */
+  for (int attempt = 0;; ++attempt) {
+    memset(g->H, 0, (size_t)g->m * (size_t)n);
+    memset(vcount, 0, (size_t)n * sizeof(int));
+    for (int b = 0; b < dv; ++b) {
+      for (int i = 0; i < n; ++i) perm[i] = i;
+      for (int i = n - 1; i > 0; --i) {
+        int j = (int)(ldpc_next(&st) % (uint64_t)(i + 1));
+        int tmp = perm[i]; perm[i] = perm[j]; perm[j] = tmp;
+      }
+      for (int r = 0; r < n / dc; ++r) {
+        int c = b * (n / dc) + r;
+        for (int j = 0; j < dc; ++j) {
+          int v = perm[r * dc + j], e = c * dc + j;
+          g->H[(size_t)c * n + v] = 1;
+          g->edge_var[e] = v;
+          g->var_edges[v * dv + vcount[v]++] = e;
+        }
+      }
+    }
+    if (attempt >= 200 || !ldpc_has_equal_columns(g)) break;
+  }
+  free(perm); free(vcount);
+  /* Gauss-Jordan on H (in place): pivot columns become an identity. */
+  int row = 0;
+  for (int col = 0; col < n && row < g->m; ++col) {
+    int p = row;
+    while (p < g->m && !g->H[(size_t)p * n + col]) ++p;
+    if (p == g->m) continue;
+    if (p != row)
+      for (int j = 0; j < n; ++j) {
+        uint8_t t = g->H[(size_t)row * n + j];
+        g->H[(size_t)row * n + j] = g->H[(size_t)p * n + j];
+        g->H[(size_t)p * n + j] = t;
+      }
+    for (int r = 0; r < g->m; ++r)
+      if (r != row && g->H[(size_t)r * n + col])
+        for (int j = col; j < n; ++j) g->H[(size_t)r * n + j] ^= g->H[(size_t)row * n + j];
+    g->pivot_col[row] = col; g->is_pivot[col] = 1; ++row;
+  }
+  g->rank = row; g->k = n - row;
+  int z = 0;
+  for (int c = 0; c < n; ++c) if (!g->is_pivot[c]) g->free_col[z++] = c;
+  return g;
+}
+static void ldpc_encode(const LdpcCode *g, const uint8_t *msg, uint8_t *word) {
+  memset(word, 0, (size_t)g->n);
+  for (int i = 0; i < g->k; ++i) word[g->free_col[i]] = msg[i] & 1;
+  for (int r = 0; r < g->rank; ++r) {
+    const uint8_t *h = g->H + (size_t)r * g->n;
+    uint8_t x = 0;
+    for (int i = 0; i < g->k; ++i) x ^= (uint8_t)(h[g->free_col[i]] & word[g->free_col[i]]);
+    word[g->pivot_col[r]] = x;
+  }
+}
+static int ldpc_syndrome_ok(const LdpcCode *g, const uint8_t *w) {
+  for (int c = 0; c < g->m; ++c) {
+    uint8_t x = 0;
+    for (int j = 0; j < g->dc; ++j) x ^= w[g->edge_var[c * g->dc + j]];
+    if (x) return 0;
+  }
+  return 1;
+}
+/* g->llr holds the channel LLRs; hard decisions go to out[0..n).  Returns 1
+ * if a zero syndrome was reached within the iteration limit. */
+static int ldpc_decode_llr(LdpcCode *g, uint8_t *out, int *used) {
+  int E = g->m * g->dc;
+  double *q = g->q, *rmsg = g->rmsg, *llr = g->llr;
+  for (int e = 0; e < E; ++e) { q[e] = llr[g->edge_var[e]]; rmsg[e] = 0.0; }
+  for (int it = 1; it <= g_ldpc_iters; ++it) {
+    for (int c = 0; c < g->m; ++c) {
+      int base = c * g->dc, dc = g->dc;
+      if (!g_ldpc_minsum) {
+        g->pre[0] = 1.0; g->suf[dc] = 1.0;
+        for (int l = 0; l < dc; ++l) {
+          g->tv[l] = tanh(q[base + l] * 0.5);
+          g->pre[l + 1] = g->pre[l] * g->tv[l];
+        }
+        for (int l = dc - 1; l >= 0; --l) g->suf[l] = g->suf[l + 1] * g->tv[l];
+        for (int j = 0; j < dc; ++j) {
+          double prod = g->pre[j] * g->suf[j + 1];
+          if (prod > 0.999999999999) prod = 0.999999999999;
+          if (prod < -0.999999999999) prod = -0.999999999999;
+          rmsg[base + j] = 2.0 * atanh(prod);
+        }
+      } else {
+        int s = 1, a1 = -1;
+        double m1 = 1e100, m2 = 1e100;
+        for (int l = 0; l < dc; ++l) {
+          double a = fabs(q[base + l]);
+          if (q[base + l] < 0) s = -s;
+          if (a < m1) { m2 = m1; m1 = a; a1 = l; } else if (a < m2) m2 = a;
+        }
+        for (int j = 0; j < dc; ++j) {
+          int sj = q[base + j] < 0 ? -s : s;
+          rmsg[base + j] = sj * g_ldpc_norm * (j == a1 ? m2 : m1);
+        }
+      }
+    }
+    for (int v = 0; v < g->n; ++v) {
+      double sum = llr[v];
+      for (int j = 0; j < g->dv; ++j) sum += rmsg[g->var_edges[v * g->dv + j]];
+      if (sum > LDPC_CLAMP) sum = LDPC_CLAMP;
+      if (sum < -LDPC_CLAMP) sum = -LDPC_CLAMP;
+      out[v] = (uint8_t)(sum < 0);
+      for (int j = 0; j < g->dv; ++j) {
+        int e = g->var_edges[v * g->dv + j];
+        double x = sum - rmsg[e];
+        if (x > LDPC_CLAMP) x = LDPC_CLAMP;
+        if (x < -LDPC_CLAMP) x = -LDPC_CLAMP;
+        q[e] = x;
+      }
+    }
+    if (ldpc_syndrome_ok(g, out)) { if (used) *used = it; return 1; }
+  }
+  if (used) *used = g_ldpc_iters;
+  return 0;
+}
+
 /* ================= unified binary code object ================= */
 static int g_fht =
     0; /* -fht: RM(1,m) is decoded by the Walsh-Hadamard transform */
@@ -9334,7 +9551,8 @@ typedef enum {
   BC_GOPPA = 1,
   BC_GOLAY = 2,
   BC_RM = 3,
-  BC_HAD = 4
+  BC_HAD = 4,
+  BC_LDPC = 5
 } BcKind;
 typedef struct {
   char name[128];
@@ -9346,6 +9564,7 @@ typedef struct {
   int rm_r, rm_m;
   unsigned *mon; /* RM: monomial x_S (bit mask S), degree <= r */
   uint8_t *gsys; /* RM: systematic generator, k rows of n bytes */
+  LdpcCode *ldpc; /* LDPC: Tanner graph, reduced H, decoder scratch */
 } BinCode;
 
 /* Release a binary-code object and all storage it owns.  For alternant/Goppa
@@ -9374,6 +9593,7 @@ static void bc_free(BinCode *B) {
   free(B->gtab);
   free(B->mon);
   free(B->gsys);
+  ldpc_free(B->ldpc);
   free(B);
 }
 
@@ -9387,6 +9607,25 @@ static BinCode *bc_from_alt(AltCode *A, const char *name, int t) {
   B->dmin = 2 * t + 1;
   B->info = A->info;
   B->alt = A;
+  return B;
+}
+static BinCode *bc_ldpc(int n, int dv, int dc, int t, uint32_t seed) {
+  LdpcCode *g = ldpc_new(n, dv, dc, seed);
+  if (g->k <= 0) die("LDPC code has no information bits");
+  BinCode *B = calloc(1, sizeof *B);
+  if (!B) die("out of memory");
+  snprintf(B->name, sizeof B->name,
+           "LDPC[%d,%d] regular dv=%d dc=%d seed=%u (nominal t, no guaranteed d)",
+           g->n, g->k, dv, dc, (unsigned)seed);
+  B->kind = BC_LDPC;
+  B->n = g->n;
+  B->k = g->k;
+  B->t = t;
+  B->dmin = 1;
+  B->info = malloc((size_t)g->k * sizeof(int));
+  if (!B->info) die("out of memory");
+  memcpy(B->info, g->free_col, (size_t)g->k * sizeof(int));
+  B->ldpc = g;
   return B;
 }
 static BinCode *bc_golay(int ext) {
@@ -9567,7 +9806,9 @@ static BinCode *bc_had(int m) {
   return B;
 }
 static void bc_encode(const BinCode *B, const uint8_t *msg, uint8_t *cw) {
-  if (B->kind == BC_GOLAY) {
+  if (B->kind == BC_LDPC) {
+    ldpc_encode(B->ldpc, msg, cw);
+  } else if (B->kind == BC_GOLAY) {
     uint32_t m = 0;
     for (int j = 0; j < 12; ++j)
       m |= (uint32_t)(msg[j] & 1) << j;
@@ -9596,6 +9837,15 @@ static void bc_encode(const BinCode *B, const uint8_t *msg, uint8_t *cw) {
  * erasures are supported by BCH/alternant codes only. */
 static int bc_decode(const BinCode *B, const uint8_t *rcv, const uint8_t *era,
                      uint8_t *out) {
+  if (B->kind == BC_LDPC) {
+    LdpcCode *g = B->ldpc;
+    for (int i = 0; i < g->n; ++i)
+      g->llr[i] = (era && era[i]) ? 0.0 : ((rcv[i] & 1) ? -4.0 : 4.0);
+    if (!ldpc_decode_llr(g, out, NULL)) return -1;
+    int cnt = 0;
+    for (int i = 0; i < g->n; ++i) cnt += (out[i] != (rcv[i] & 1));
+    return cnt;
+  }
   if (B->kind == BC_GOLAY) {
     uint32_t v = 0;
     for (int i = 0; i < 23; ++i)
@@ -9646,6 +9896,10 @@ static BinCode *bc_parse(const char *spec, unsigned poly) {
     return bc_golay(1);
   if (!strcmp(tok[0], "had") && nt >= 2)
     return bc_had(v[1]);
+  if (!strcmp(tok[0], "ldpc") && nt >= 4)
+    return bc_ldpc(v[1], v[2], v[3], nt > 4 && v[4] > 0 ? v[4] : 2,
+                   nt > 5 ? (uint32_t)strtoul(tok[5], NULL, 10)
+                          : ((uint32_t)(rnd() >> 16) | 1u));
   if (!strcmp(tok[0], "rm") && nt >= 3)
     return bc_rm(v[1], v[2]);
   if (!strcmp(tok[0], "bch") && nt >= 3) {
@@ -9688,7 +9942,8 @@ static BinCode *bc_parse(const char *spec, unsigned poly) {
     return B;
   }
   die("bad code spec '%s' (bch:m:t[:n[:b]] | golay | golay24 | goppa:m:t[:n] | "
-      "alt:m:n:t | srivastava:m:s[:n[:mu]] | gs:m:s:t[:n] | rm:r:m | had:m)",
+      "alt:m:n:t | srivastava:m:s[:n[:mu]] | gs:m:s:t[:n] | rm:r:m | had:m | "
+      "ldpc:n:dv:dc[:t[:seed]])",
       spec);
   return NULL;
 }
@@ -10200,8 +10455,8 @@ static void run_bincode_file(const BinCode *B, const char *inpath,
 static void run_bincode(const BinCode *B, int trials, int nerr, int nera,
                         int verbose, int showv) {
   int n = B->n, k = B->k;
-  if (nera && B->kind != BC_ALT)
-    die("--erasures is supported for bch / alt codes (and grs, concat)");
+  if (nera && B->kind != BC_ALT && B->kind != BC_LDPC)
+    die("--erasures is supported for bch / alt / ldpc codes (and grs, concat)");
   if (nera && g_alt_eea)
     die("-eea currently supports errors only; use the default BM decoder for erasures");
   if (nerr + nera > n)
@@ -11425,7 +11680,7 @@ static int ag_concat_run(const fe *Gen, const fe *VG, int npts, int kcode,
 static void usage(void) {
   puts(
       "codes [options] [seed]\n"
-      "  --code bch|golay|goppa|alt|srivastava|gs|rm|hadamard|rs|grs|rank|product|concat   "
+      "  --code bch|golay|goppa|alt|srivastava|gs|rm|hadamard|ldpc|rs|grs|rank|product|concat   "
       "(default bch)\n"
       "  --m m           field GF(2^m), m <= 12              (default per "
       "code)\n"
@@ -11450,12 +11705,22 @@ static void usage(void) {
       "  --output FILE   decoded output file\n"
       "  --output-format binary|text|screen   output format (default screen)\n"
       "  --no-errors     do not inject errors (file mode default)\n"
+      "  --mode demo|encode|noise|decode   (binary codes incl. ldpc; raw bytes)\n"
+      "        demo    (default) --input/--output round trip with injected errors\n"
+      "        encode  --input FILE --output CODED   file -> coded file (header stores the code)\n"
+      "        noise   --input CODED --output NOISY --errors N   flip N bits per block\n"
+      "        decode  --input CODED --output FILE   no code options needed (read from header)\n"
+      "        ('-' = stdin/stdout; exit status 2 if the CRC32 check fails)\n"
+      "  --dv dv --dc dc   ldpc: column/row weight (default 3, 6); --len n = block length (default 120)\n"
+      "  --ldpc-seed s   ldpc: seed of the parity-check matrix (default: drawn from the run seed)\n"
+      "  --ldpc-decoder sum|minsum   --ldpc-iters N (default 50)   --ldpc-norm x (min-sum, default 0.8)\n"
+      "  (ldpc: --t is only a nominal capability; use --errors to choose the test load)\n"
       "  --c1 spec --c2 spec   product code components (default bch:5:2 and "
       "c1)\n"
       "  --inner spec    concat: inner binary code             (default "
       "golay)\n"
       "        specs:  bch:m:t[:n[:b]]  golay  golay24  goppa:m:t[:n]  "
-      "alt:m:n:t  srivastava:m:s[:n[:mu]]  gs:m:s:t[:n]  rm:r:m  had:m\n"
+      "alt:m:n:t  srivastava:m:s[:n[:mu]]  gs:m:s:t[:n]  rm:r:m  had:m  ldpc:n:dv:dc[:t[:seed]]\n"
       "  -eea            alternant/Srivastava: extended-Euclid decoder (no erasures)\n"
       "  (default alternant/Srivastava decoder: Berlekamp-Massey)\n"
       "  --iters N       product: maximal row/column sweeps  (default 8)\n"
@@ -11477,6 +11742,11 @@ static void usage(void) {
       "  codes --code rs  --m 8 --len 255 --k 223 --errors 10 --erasures 12\n"
       "  codes --code grs --m 8 --len 255 --k 223 --errors 10 --erasures 12\n"
       "  codes --code rank --m 8 --len 8 --k 4 --errors 2\n"
+      "  codes --code ldpc --len 1200 --dv 3 --dc 6 --errors 30 -n 50\n"
+      "  codes --code ldpc --len 1200 --mode encode --input a.bin --output a.enc\n"
+      "  codes --mode noise  --input a.enc --output a.noisy --errors 10\n"
+      "  codes --mode decode --input a.noisy --output a.out\n"
+      "  codes --code goppa --m 8 --t 10 --mode encode --input a.bin --output a.enc\n"
       "  codes --code product --c1 bch:5:2 --c2 golay --errors 8\n"
       "  codes --code concat --m 12 --len 100 --k 60 --inner golay --errors "
       "100");
@@ -11484,6 +11754,189 @@ static void usage(void) {
 static int flag(const char *a, const char *name) {
   return a[0] == '-' &&
          (!strcmp(a + 1, name) || (a[1] == '-' && !strcmp(a + 2, name)));
+}
+
+/* ================= coded-file container: --mode encode | noise | decode =====
+ * File layout (little endian):
+ *    0  4  magic "UCOD"          4  1  version (=1)        5  3  reserved
+ *    8 16  code name (bch, goppa, ldpc, ...)
+ *   24 64  16 x u32: m poly len k t s mu b r ext dv dc ldpc_seed seed n kdim
+ *   88  8  original byte length                96  4  CRC32 of original data
+ *  100  4  fingerprint of the code (CRC32 of 3 test codewords)
+ *  104  -  blocks: n bits each (MSB first), padded to a whole byte
+ * Everything needed to rebuild the code is stored, so decode needs no code
+ * options.  The fingerprint detects a rebuilt code that differs from the
+ * one used for encoding. */
+#define UC_HDR 104
+enum { UC_M, UC_POLY, UC_LEN, UC_K, UC_T, UC_S, UC_MU, UC_B, UC_R, UC_EXT,
+       UC_DV, UC_DC, UC_LSEED, UC_SEED, UC_N, UC_KDIM, UC_NF };
+typedef struct {
+  char code[16];
+  uint32_t f[UC_NF];
+  uint64_t orig_len;
+  uint32_t crc, fp;
+} UcHdr;
+
+static void uc_put32(uint8_t *p, uint32_t v) { for (int i = 0; i < 4; ++i) p[i] = (uint8_t)(v >> (8 * i)); }
+static void uc_put64(uint8_t *p, uint64_t v) { for (int i = 0; i < 8; ++i) p[i] = (uint8_t)(v >> (8 * i)); }
+static uint32_t uc_get32(const uint8_t *p) { uint32_t v = 0; for (int i = 3; i >= 0; --i) v = (v << 8) | p[i]; return v; }
+static uint64_t uc_get64(const uint8_t *p) { uint64_t v = 0; for (int i = 7; i >= 0; --i) v = (v << 8) | p[i]; return v; }
+static uint32_t uc_crc_upd(uint32_t c, const uint8_t *p, size_t len) {
+  for (size_t i = 0; i < len; ++i) {
+    c ^= p[i];
+    for (int b = 0; b < 8; ++b) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+  }
+  return c;
+}
+static uint32_t uc_crc32(const uint8_t *p, size_t len) { return ~uc_crc_upd(0xFFFFFFFFu, p, len); }
+
+static uint8_t *uc_read_file(const char *path, size_t *len) {
+  FILE *in = !strcmp(path, "-") ? stdin : fopen(path, "rb");
+  if (!in) die("cannot open input '%s': %s", path, strerror(errno));
+  size_t cap = 1 << 16, n = 0;
+  uint8_t *buf = malloc(cap);
+  if (!buf) die("out of memory reading input");
+  for (;;) {
+    if (n == cap) {
+      cap *= 2;
+      uint8_t *t = realloc(buf, cap);
+      if (!t) die("out of memory reading input");
+      buf = t;
+    }
+    size_t got = fread(buf + n, 1, cap - n, in);
+    n += got;
+    if (got == 0) break;
+  }
+  if (ferror(in)) die("error reading input '%s'", path);
+  if (in != stdin) fclose(in);
+  *len = n;
+  return buf;
+}
+static void uc_write_file(const char *path, const uint8_t *d, size_t len) {
+  FILE *fp = !strcmp(path, "-") ? stdout : fopen(path, "wb");
+  if (!fp) die("cannot open output '%s': %s", path, strerror(errno));
+  if (len && fwrite(d, 1, len, fp) != len) die("error writing output '%s'", path);
+  if (fp == stdout) fflush(stdout);
+  else if (fclose(fp)) die("error closing output '%s'", path);
+}
+static void uc_hdr_write(uint8_t *p, const UcHdr *h) {
+  memset(p, 0, UC_HDR);
+  memcpy(p, "UCOD", 4);
+  p[4] = 1;
+  memcpy(p + 8, h->code, 16);
+  for (int i = 0; i < UC_NF; ++i) uc_put32(p + 24 + 4 * i, h->f[i]);
+  uc_put64(p + 88, h->orig_len);
+  uc_put32(p + 96, h->crc);
+  uc_put32(p + 100, h->fp);
+}
+static void uc_hdr_parse(const uint8_t *p, size_t size, UcHdr *h) {
+  if (size < UC_HDR || memcmp(p, "UCOD", 4) || p[4] != 1)
+    die("not a coded file produced by --mode encode (bad magic/version)");
+  memcpy(h->code, p + 8, 16);
+  h->code[15] = 0;
+  for (int i = 0; i < UC_NF; ++i) h->f[i] = uc_get32(p + 24 + 4 * i);
+  h->orig_len = uc_get64(p + 88);
+  h->crc = uc_get32(p + 96);
+  h->fp = uc_get32(p + 100);
+  if (h->f[UC_N] == 0 || h->f[UC_N] > (1u << 24) || h->f[UC_KDIM] == 0 ||
+      h->f[UC_KDIM] > h->f[UC_N] || h->orig_len > SIZE_MAX / 8)
+    die("corrupt header in coded file");
+}
+static int uc_block_bytes(int n) { return (n + 7) / 8; }
+static int uc_getbit(const uint8_t *d, size_t i) { return (d[i >> 3] >> (7 - (i & 7))) & 1; }
+
+static uint32_t uc_fingerprint(const BinCode *B) {
+  uint64_t st = 0x5DEECE66DULL;
+  uint8_t *msg = malloc((size_t)B->k), *cw = malloc((size_t)B->n);
+  if (!msg || !cw) die("out of memory");
+  uint32_t c = 0xFFFFFFFFu;
+  for (int r = 0; r < 3; ++r) {
+    for (int j = 0; j < B->k; ++j) msg[j] = (uint8_t)(ldpc_next(&st) & 1);
+    bc_encode(B, msg, cw);
+    c = uc_crc_upd(c, cw, (size_t)B->n);
+  }
+  free(msg); free(cw);
+  return ~c;
+}
+
+static int uc_encode_file(const BinCode *B, UcHdr *h, const char *inpath, const char *outpath) {
+  size_t len = 0;
+  uint8_t *data = uc_read_file(inpath, &len);
+  int n = B->n, k = B->k, bpb = uc_block_bytes(n);
+  size_t nbits = len * 8, blocks = (nbits + (size_t)k - 1) / (size_t)k;
+  if (len > SIZE_MAX / 8 || blocks > (SIZE_MAX - UC_HDR) / (size_t)bpb) die("input too large");
+  h->f[UC_N] = (uint32_t)n; h->f[UC_KDIM] = (uint32_t)k;
+  h->orig_len = len; h->crc = uc_crc32(data, len); h->fp = uc_fingerprint(B);
+  size_t outlen = UC_HDR + blocks * (size_t)bpb;
+  uint8_t *out = calloc(outlen, 1), *msg = malloc((size_t)k), *cw = malloc((size_t)n);
+  if (!out || !msg || !cw) die("out of memory");
+  uc_hdr_write(out, h);
+  for (size_t b = 0; b < blocks; ++b) {
+    size_t off = b * (size_t)k;
+    for (int j = 0; j < k; ++j) msg[j] = off + (size_t)j < nbits ? (uint8_t)uc_getbit(data, off + (size_t)j) : 0;
+    bc_encode(B, msg, cw);
+    uint8_t *dst = out + UC_HDR + b * (size_t)bpb;
+    for (int i = 0; i < n; ++i) if (cw[i]) dst[i >> 3] |= (uint8_t)(1u << (7 - (i & 7)));
+  }
+  uc_write_file(outpath, out, outlen);
+  fprintf(stderr, "# encoded %zu bytes -> %zu bytes: %s, blocks=%zu, rate=%.4f\n",
+          len, outlen, B->name, blocks, (double)k / (double)n);
+  free(data); free(out); free(msg); free(cw);
+  return 0;
+}
+
+static int uc_noise_file(uint8_t *buf, size_t size, const char *outpath, int nerr) {
+  UcHdr h;
+  uc_hdr_parse(buf, size, &h);
+  int n = (int)h.f[UC_N], bpb = uc_block_bytes(n);
+  if (nerr > n) die("--errors must not exceed code length n=%d", n);
+  if ((size - UC_HDR) % (size_t)bpb) die("coded file size is inconsistent with its header");
+  size_t blocks = (size - UC_HDR) / (size_t)bpb;
+  int *ep = malloc(sizeof(int) * (size_t)(nerr + 1));
+  if (!ep) die("out of memory");
+  for (size_t b = 0; b < blocks; ++b) {
+    uint8_t *p = buf + UC_HDR + b * (size_t)bpb;
+    pick(n, nerr, ep, NULL);
+    for (int e = 0; e < nerr; ++e) p[ep[e] >> 3] ^= (uint8_t)(1u << (7 - (ep[e] & 7)));
+  }
+  uc_write_file(outpath, buf, size);
+  fprintf(stderr, "# noise: flipped %d bit(s) in each of %zu block(s) (n=%d)\n", nerr, blocks, n);
+  free(ep);
+  return 0;
+}
+
+static int uc_decode_file(const BinCode *B, const UcHdr *h, const uint8_t *buf, size_t size,
+                          const char *outpath, int verbose) {
+  int n = B->n, k = B->k, bpb = uc_block_bytes(n);
+  if ((uint32_t)n != h->f[UC_N] || (uint32_t)k != h->f[UC_KDIM] || uc_fingerprint(B) != h->fp)
+    die("the code rebuilt from the header differs from the one used for encoding "
+        "(different program version?)");
+  size_t len = (size_t)h->orig_len, nbits = len * 8;
+  size_t blocks = (nbits + (size_t)k - 1) / (size_t)k;
+  if (blocks > (SIZE_MAX - UC_HDR) / (size_t)bpb || size != UC_HDR + blocks * (size_t)bpb)
+    die("coded file is truncated or has an inconsistent size");
+  uint8_t *out = calloc(len ? len : 1, 1), *rv = malloc((size_t)n), *cw = malloc((size_t)n);
+  if (!out || !rv || !cw) die("out of memory");
+  size_t failed = 0;
+  double t0 = now();
+  for (size_t b = 0; b < blocks; ++b) {
+    const uint8_t *src = buf + UC_HDR + b * (size_t)bpb;
+    for (int i = 0; i < n; ++i) rv[i] = (uint8_t)((src[i >> 3] >> (7 - (i & 7))) & 1);
+    int res = bc_decode(B, rv, NULL, cw);
+    if (res < 0) { ++failed; if (verbose) fprintf(stderr, "# block %zu/%zu: decoding failure detected\n", b + 1, blocks); }
+    size_t off = b * (size_t)k;
+    for (int j = 0; j < k && off + (size_t)j < nbits; ++j)
+      if (cw[B->info[j]]) out[(off + (size_t)j) >> 3] |= (uint8_t)(1u << (7 - ((off + (size_t)j) & 7)));
+  }
+  double dt = now() - t0;
+  int crc_ok = uc_crc32(out, len) == h->crc;
+  uc_write_file(outpath, out, len);
+  fprintf(stderr, "# decoded %zu block(s): %s, %zu detected failure(s), %.6f s\n",
+          blocks, B->name, failed, dt);
+  fprintf(stderr, "# CRC32 check: %s\n",
+          crc_ok ? "OK (data matches the original)" : "MISMATCH (uncorrectable errors)");
+  free(out); free(rv); free(cw);
+  return (crc_ok && !failed) ? 0 : 2;
 }
 
 int codes_run(int argc, char **argv) {
@@ -11494,8 +11947,13 @@ int codes_run(int argc, char **argv) {
   int m = 0, len = -1, k = -1, t = -1, sparam = -1, mu = 0, b = 1,
       nerr = -1, nera = 0, trials = 1, verbose = 0, showv = 0,
       only_list = 0, iters = 8, ext = 0, shuffle = 0, randv = 0,
-      rmr = 2, use_ecp = 0;
-  unsigned poly = 0, seed = 1;
+      rmr = 2, use_ecp = 0, dv = 3, dc = 6;
+  const char *mode = "demo";
+  unsigned poly = 0, seed = 1, ldpc_seed = 0;
+  UcHdr uh;
+  uint8_t *uc_buf = NULL;
+  size_t uc_size = 0;
+  memset(&uh, 0, sizeof uh);
   for (int i = 1; i < argc; ++i) {
     if (!strcmp(argv[i], "--code") && i + 1 < argc)
       code = argv[++i];
@@ -11519,7 +11977,24 @@ int codes_run(int argc, char **argv) {
       b = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--errors") && i + 1 < argc)
       nerr = atoi(argv[++i]);
-    else if (!strcmp(argv[i], "--input") && i + 1 < argc)
+    else if (!strcmp(argv[i], "--mode") && i + 1 < argc)
+      mode = argv[++i];
+    else if (!strcmp(argv[i], "--dv") && i + 1 < argc)
+      dv = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--dc") && i + 1 < argc)
+      dc = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--ldpc-seed") && i + 1 < argc)
+      ldpc_seed = (unsigned)strtoul(argv[++i], NULL, 10);
+    else if (!strcmp(argv[i], "--ldpc-iters") && i + 1 < argc)
+      g_ldpc_iters = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--ldpc-norm") && i + 1 < argc)
+      g_ldpc_norm = strtod(argv[++i], NULL);
+    else if (!strcmp(argv[i], "--ldpc-decoder") && i + 1 < argc) {
+      const char *v = argv[++i];
+      if (!strcmp(v, "minsum")) g_ldpc_minsum = 1;
+      else if (!strcmp(v, "sum")) g_ldpc_minsum = 0;
+      else die("--ldpc-decoder must be sum or minsum");
+    } else if (!strcmp(argv[i], "--input") && i + 1 < argc)
       input_path = argv[++i];
     else if (!strcmp(argv[i], "--output") && i + 1 < argc)
       output_path = argv[++i];
@@ -11573,14 +12048,39 @@ int codes_run(int argc, char **argv) {
   }
   if (trials < 1)
     trials = 1;
+  if (g_ldpc_iters < 1 || g_ldpc_norm <= 0.0 || g_ldpc_norm > 1.0)
+    die("invalid --ldpc-iters / --ldpc-norm");
+  int is_enc = !strcmp(mode, "encode"), is_dec = !strcmp(mode, "decode"),
+      is_noise = !strcmp(mode, "noise");
+  if (!is_enc && !is_dec && !is_noise && strcmp(mode, "demo"))
+    die("--mode must be demo, encode, decode or noise");
+  int codec = is_enc || is_dec || is_noise;
+  if (codec && !input_path) die("--mode %s needs --input FILE ('-' = stdin)", mode);
+  if (codec && !output_path) die("--mode %s needs --output FILE ('-' = stdout)", mode);
+  if (is_dec) {
+    /* the header carries every construction parameter: restore them first */
+    uc_buf = uc_read_file(input_path, &uc_size);
+    uc_hdr_parse(uc_buf, uc_size, &uh);
+    code = uh.code;
+    m = (int)uh.f[UC_M]; poly = uh.f[UC_POLY]; len = (int)uh.f[UC_LEN];
+    k = (int)uh.f[UC_K]; t = (int)uh.f[UC_T]; sparam = (int)uh.f[UC_S];
+    mu = (int)uh.f[UC_MU]; b = (int)uh.f[UC_B]; rmr = (int)uh.f[UC_R];
+    ext = (int)uh.f[UC_EXT]; dv = (int)uh.f[UC_DV]; dc = (int)uh.f[UC_DC];
+    ldpc_seed = uh.f[UC_LSEED]; seed = uh.f[UC_SEED];
+  }
   rng_s ^= (uint64_t)seed * 0x9E3779B97F4A7C15ULL;
   for (int i = 0; i < 8; ++i)
     (void)rnd();
+  if (is_noise) {
+    if (nerr < 0) die("--mode noise needs --errors N (bit flips per block)");
+    uc_buf = uc_read_file(input_path, &uc_size);
+    return uc_noise_file(uc_buf, uc_size, output_path, nerr);
+  }
 
   if (!strcmp(code, "bch") || !strcmp(code, "alt") || !strcmp(code, "goppa") ||
       !strcmp(code, "srivastava") || !strcmp(code, "gs") ||
       !strcmp(code, "golay") || !strcmp(code, "rm") ||
-      !strcmp(code, "hadamard")) {
+      !strcmp(code, "hadamard") || !strcmp(code, "ldpc")) {
     BinCode *B;
     char spec[64];
     if (!strcmp(code, "golay"))
@@ -11589,6 +12089,10 @@ int codes_run(int argc, char **argv) {
       B = bc_had(m ? m : 6);
     else if (!strcmp(code, "rm"))
       B = bc_rm(rmr, m ? m : 5);
+    else if (!strcmp(code, "ldpc")) {
+      if (!ldpc_seed) ldpc_seed = (unsigned)(rnd() >> 16) | 1u;
+      B = bc_ldpc(len > 0 ? len : 120, dv, dc, t > 0 ? t : 2, ldpc_seed);
+    }
     else if (!strcmp(code, "srivastava") || !strcmp(code, "gs")) {
       int mm = m ? m : (!strcmp(code, "srivastava") ? 6 : 8);
       int ss = sparam > 0 ? sparam : (!strcmp(code, "srivastava") ? 8 : 3);
@@ -11624,7 +12128,7 @@ int codes_run(int argc, char **argv) {
     }
     if (nerr < 0 && !input_path)
       nerr = B->t;
-    if (input_path)
+    if (input_path || codec)
       fprintf(stderr, "# code: %s, dimension k=%d, corrects t=%d errors%s\n",
               B->name, B->k, B->t,
               B->kind == BC_ALT ? " (+ erasures: 2e+s <= r)" : "");
@@ -11633,6 +12137,17 @@ int codes_run(int argc, char **argv) {
              B->k, B->t, B->kind == BC_ALT ? " (+ erasures: 2e+s <= r)" : "");
     if (only_list)
       return 0;
+    if (is_enc) {
+      snprintf(uh.code, sizeof uh.code, "%s", code);
+      uh.f[UC_M] = (uint32_t)m; uh.f[UC_POLY] = poly; uh.f[UC_LEN] = (uint32_t)len;
+      uh.f[UC_K] = (uint32_t)k; uh.f[UC_T] = (uint32_t)t; uh.f[UC_S] = (uint32_t)sparam;
+      uh.f[UC_MU] = (uint32_t)mu; uh.f[UC_B] = (uint32_t)b; uh.f[UC_R] = (uint32_t)rmr;
+      uh.f[UC_EXT] = (uint32_t)ext; uh.f[UC_DV] = (uint32_t)dv; uh.f[UC_DC] = (uint32_t)dc;
+      uh.f[UC_LSEED] = ldpc_seed; uh.f[UC_SEED] = seed;
+      return uc_encode_file(B, &uh, input_path, output_path);
+    }
+    if (is_dec)
+      return uc_decode_file(B, &uh, uc_buf, uc_size, output_path, verbose);
     if (input_path) {
       if (nera)
         die("--erasures is not available in file mode yet");
@@ -11655,8 +12170,8 @@ int codes_run(int argc, char **argv) {
   }
   if (input_path || output_path || strcmp(input_format, "binary") ||
       strcmp(output_format, "screen"))
-    die("file mode is currently implemented for "
-        "bch/golay/goppa/alt/srivastava/gs/rm/hadamard");
+    die("file mode and --mode encode/decode/noise are implemented for "
+        "bch/golay/goppa/alt/srivastava/gs/rm/hadamard/ldpc");
   if (!strcmp(code, "rs") || !strcmp(code, "grs")) {
     int mm = m ? m : 8;
     if (!strcmp(code, "rs") && randv)
@@ -11751,7 +12266,7 @@ static void unified_usage(void) {
   puts("\nFAMILIES");
   puts("  ag          Algebraic-geometry codes (default; "
        "BBGS/Hermitian/Suzuki/custom)");
-  puts("  classical   BCH, Golay, Goppa, alternant, Srivastava/GS, Reed-Muller, Hadamard,");
+  puts("  classical   BCH, Golay, Goppa, alternant, Srivastava/GS, Reed-Muller, Hadamard, LDPC,");
   puts("              RS/GRS, Gabidulin(rank), product, and concatenated codes");
   puts("\nHELP");
   puts("  --help                    Show this overview");
@@ -11796,8 +12311,13 @@ int main(int argc, char **argv) {
       return 2;
     }
     first = 2;
-  } else if (argc > 1 && !strcmp(argv[1], "--code")) {
-    fam = 1;
+  } else {
+    /* --code / --mode anywhere on the line selects the classical family */
+    for (int i = 1; i < argc; ++i)
+      if (!strcmp(argv[i], "--code") || !strcmp(argv[i], "--mode")) {
+        fam = 1;
+        break;
+      }
   }
   if (argc > 1 && !strcmp(argv[1], "--help-all") && first == 1) {
     unified_usage();
